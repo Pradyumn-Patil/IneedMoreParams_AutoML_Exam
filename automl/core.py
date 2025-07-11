@@ -6,6 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
 from automl.models import SimpleFFNN, LSTMClassifier
 from automl.utils import SimpleTextDataset
 from pathlib import Path
@@ -37,6 +38,9 @@ class TextAutoML:
         lstm_emb_dim=128,
         lstm_hidden_dim=128,
         fraction_layers_to_finetune: float=1.0,
+        # LogisticRegression parameters
+        logistic_C=1.0, # Regularization strength
+        logistic_max_iter=1000,
     ):
         self.seed = seed
         np.random.seed(seed)
@@ -55,6 +59,10 @@ class TextAutoML:
         self.lstm_emb_dim = lstm_emb_dim
         self.lstm_hidden_dim = lstm_hidden_dim
         self.fraction_layers_to_finetune = fraction_layers_to_finetune
+        
+        # LogisticRegression parameters
+        self.logistic_C = logistic_C
+        self.logistic_max_iter = logistic_max_iter
 
         self.model = None
         self.tokenizer = None
@@ -126,30 +134,46 @@ class TextAutoML:
         logger.info(f"Val class distribution: {Counter(self.val_labels)}")
 
         dataset = None
-        if self.approach == 'tfidf':
+        if self.approach in ['ffnn', 'logistic']:
+            # Both use TF-IDF vectorization
             self.vectorizer = TfidfVectorizer(
                 max_features=self.vocab_size,
                 lowercase=True,
                 min_df=2,    # ignore words appearing in less than 2 sentences
                 max_df=0.8,  # ignore words appearing in > 80% of sentences
                 sublinear_tf=True,  # use log-spaced term-frequency scoring
+                ngram_range=(1, 2),  # unigrams and bigrams
             )
-            X = self.vectorizer.fit_transform(self.train_texts).toarray()
-            dataset = torch.utils.data.TensorDataset(
-                torch.tensor(X, dtype=torch.float32),
-                torch.tensor(self.train_labels)
-            )
-            # models and dataloaders
-            train_loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-            X = self.vectorizer.transform(self.val_texts).toarray()
-            _dataset = torch.utils.data.TensorDataset(
-                torch.tensor(X, dtype=torch.float32),
-                torch.tensor(self.val_labels)
-            )
-            val_loader = DataLoader(_dataset, batch_size=self.batch_size, shuffle=True)
-            self.model = SimpleFFNN(
-                X.shape[1], hidden=self.ffnn_hidden, output_dim=self.num_classes
-            )
+            X_train = self.vectorizer.fit_transform(self.train_texts)
+            X_val = self.vectorizer.transform(self.val_texts)
+            
+            if self.approach == 'ffnn':
+                # Convert to dense arrays for PyTorch
+                X_train_dense = X_train.toarray()
+                X_val_dense = X_val.toarray()
+                
+                dataset = torch.utils.data.TensorDataset(
+                    torch.tensor(X_train_dense, dtype=torch.float32),
+                    torch.tensor(self.train_labels)
+                )
+                train_loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
+                _dataset = torch.utils.data.TensorDataset(
+                    torch.tensor(X_val_dense, dtype=torch.float32),
+                    torch.tensor(self.val_labels)
+                )
+                val_loader = DataLoader(_dataset, batch_size=self.batch_size, shuffle=True)
+                self.model = SimpleFFNN(
+                    X_train_dense.shape[1], hidden=self.ffnn_hidden, output_dim=self.num_classes
+                )
+            elif self.approach == 'logistic': 
+                # Use sklearn LogisticRegression directly with sparse matrices
+                self.model = LogisticRegression(
+                    C=self.logistic_C,
+                    max_iter=self.logistic_max_iter,
+                    random_state=self.seed
+                )
+                # For logistic regression, we'll handle training differently
+                train_loader = val_loader = None  # Not used for sklearn model
 
         elif self.approach in ['lstm', 'transformer']:
             model_name = 'distilbert-base-uncased'
@@ -190,17 +214,31 @@ class TextAutoML:
             raise ValueError(f"Unrecognized approach: {self.approach}")
         
         # Training and validating
-        self.model.to(self.device)
-        assert dataset is not None, f"`dataset` cannot be None here!"
-        # loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True)
-        val_acc = self._train_loop(
-            train_loader,
-            val_loader,
-            load_path=load_path,
-            save_path=save_path,
-        )
-
-        return 1 - val_acc
+        if self.approach == 'logistic':
+            # For sklearn LogisticRegression, training is different
+            X_train = self.vectorizer.transform(self.train_texts)
+            X_val = self.vectorizer.transform(self.val_texts)
+            
+            logger.info("Training Logistic Regression model...")
+            self.model.fit(X_train, self.train_labels)
+            
+            # Evaluate on validation set
+            val_preds = self.model.predict(X_val)
+            val_acc = accuracy_score(self.val_labels, val_preds)
+            logger.info(f"Validation Accuracy: {val_acc:.4f}")
+            
+            return 1 - val_acc
+        else:
+            # For PyTorch models
+            self.model.to(self.device)
+            assert dataset is not None, f"`dataset` cannot be None here!"
+            val_acc = self._train_loop(
+                train_loader,
+                val_loader,
+                load_path=load_path,
+                save_path=save_path,
+            )
+            return 1 - val_acc
 
     def _train_loop(
         self, 
@@ -235,7 +273,7 @@ class TextAutoML:
                     labels = inputs['labels']
                 else:
                     match self.approach:
-                        case "tfidf":
+                        case "ffnn":
                             x, y = batch[0].to(self.device), batch[1].to(self.device)
                             outputs = self.model(x)
                             labels = y
@@ -291,7 +329,7 @@ class TextAutoML:
                     labels.extend(batch["labels"])
                 else:
                     match self.approach:
-                        case "tfidf":
+                        case "ffnn":
                             x, y = batch[0].to(self.device), batch[1].to(self.device)
                             outputs = self.model(x)
                             labels.extend(y)
@@ -321,7 +359,14 @@ class TextAutoML:
         if isinstance(test_data, DataLoader):
             return self._predict(test_data)
         
-        if self.approach == 'tfidf':
+        if self.approach == 'logistic':
+            # For sklearn LogisticRegression
+            _X = self.vectorizer.transform(test_data['text'].tolist())
+            _labels = test_data['label'].tolist()
+            _preds = self.model.predict(_X)
+            return np.array(_preds), np.array(_labels)
+            
+        elif self.approach == 'ffnn':
             _X = self.vectorizer.transform(test_data['text'].tolist()).toarray()
             _labels = test_data['label'].tolist()
             _dataset = torch.utils.data.TensorDataset(
@@ -329,6 +374,8 @@ class TextAutoML:
                 torch.tensor(_labels)
             )
             _loader = DataLoader(_dataset, batch_size=self.batch_size, shuffle=True)
+            return self._predict(_loader)
+            
         elif self.approach in ['lstm', 'transformer']:
             _dataset = SimpleTextDataset(
                 test_data['text'].tolist(),
@@ -337,11 +384,10 @@ class TextAutoML:
                 self.token_length
             )
             _loader = DataLoader(_dataset, batch_size=self.batch_size, shuffle=True)
+            return self._predict(_loader)
         else:
             raise ValueError(f"Unrecognized approach: {self.approach}")
             # handling any possible tokenization
-        
-        return self._predict(_loader)
 
 
 def freeze_layers(model, fraction_layers_to_finetune: float=1.0) -> None:
