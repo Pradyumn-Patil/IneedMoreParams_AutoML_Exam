@@ -15,13 +15,19 @@ from typing import Tuple
 from collections import Counter
 
 try:
+    import optuna
+    from optuna.samplers import TPESampler
+    OPTUNA_AVAILABLE = True
+except ImportError:
+    OPTUNA_AVAILABLE = False
+
+try:
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
-
 
 class TextAutoML:
     def __init__(
@@ -202,7 +208,7 @@ class TextAutoML:
                             model_name, 
                             num_labels=self.num_classes
                         )
-                        freeze_layers(self.model, self.fraction_layers_to_finetune)  
+                        self._freeze_layers(self.model, self.fraction_layers_to_finetune)  
                     else:
                         raise ValueError(
                             "Need `AutoTokenizer`, `AutoModelForSequenceClassification` "
@@ -389,13 +395,156 @@ class TextAutoML:
             raise ValueError(f"Unrecognized approach: {self.approach}")
             # handling any possible tokenization
 
+    def _create_hpo_search_space(self, trial):
+        """Create hyperparameter search space for the current approach."""
+        if not OPTUNA_AVAILABLE:
+            raise ImportError("Optuna is required for HPO. Install with: pip install optuna")
+            
+        params = {}
+        
+        if self.approach == 'logistic':
+            params['logistic_C'] = trial.suggest_float('logistic_C', 0.001, 100.0, log=True)
+            params['logistic_max_iter'] = trial.suggest_int('logistic_max_iter', 100, 2000)
+            params['vocab_size'] = trial.suggest_int('vocab_size', 5000, 20000)
+            
+        elif self.approach == 'ffnn':
+            params['lr'] = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
+            params['weight_decay'] = trial.suggest_float('weight_decay', 0.0, 0.1)
+            params['batch_size'] = trial.suggest_categorical('batch_size', [16, 32, 64, 128])
+            params['ffnn_hidden'] = trial.suggest_int('ffnn_hidden', 64, 512)
+            params['epochs'] = trial.suggest_int('epochs', 3, 10)
+            params['vocab_size'] = trial.suggest_int('vocab_size', 5000, 20000)
+            
+        elif self.approach == 'lstm':
+            params['lr'] = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
+            params['weight_decay'] = trial.suggest_float('weight_decay', 0.0, 0.1)
+            params['batch_size'] = trial.suggest_categorical('batch_size', [16, 32, 64])
+            params['lstm_emb_dim'] = trial.suggest_int('lstm_emb_dim', 64, 256)
+            params['lstm_hidden_dim'] = trial.suggest_int('lstm_hidden_dim', 64, 256)
+            params['epochs'] = trial.suggest_int('epochs', 3, 10)
+            params['token_length'] = trial.suggest_int('token_length', 64, 256)
+            
+        elif self.approach == 'transformer':
+            params['lr'] = trial.suggest_float('lr', 1e-6, 1e-3, log=True)
+            params['weight_decay'] = trial.suggest_float('weight_decay', 0.0, 0.1)
+            params['batch_size'] = trial.suggest_categorical('batch_size', [8, 16, 32])
+            params['fraction_layers_to_finetune'] = trial.suggest_float('fraction_layers_to_finetune', 0.1, 1.0)
+            params['epochs'] = trial.suggest_int('epochs', 2, 5)
+            params['token_length'] = trial.suggest_int('token_length', 128, 512)
+            
+        return params
 
-def freeze_layers(model, fraction_layers_to_finetune: float=1.0) -> None:
-    total_layers = len(model.distilbert.transformer.layer)
-    _num_layers_to_finetune = int(fraction_layers_to_finetune * total_layers)
-    layers_to_freeze = total_layers - _num_layers_to_finetune
+    def _hpo_objective(self, trial):
+        """Objective function for Optuna hyperparameter optimization."""
+        params = self._create_hpo_search_space(trial)
+        
+        # Create temporary AutoML instance with suggested parameters
+        temp_automl = TextAutoML(
+            seed=self.seed,
+            approach=self.approach,
+            vocab_size=params.get('vocab_size', self.vocab_size),
+            token_length=params.get('token_length', self.token_length),
+            epochs=params.get('epochs', self.epochs),
+            batch_size=params.get('batch_size', self.batch_size),
+            lr=params.get('lr', self.lr),
+            weight_decay=params.get('weight_decay', self.weight_decay),
+            ffnn_hidden=params.get('ffnn_hidden', self.ffnn_hidden),
+            lstm_emb_dim=params.get('lstm_emb_dim', self.lstm_emb_dim),
+            lstm_hidden_dim=params.get('lstm_hidden_dim', self.lstm_hidden_dim),
+            fraction_layers_to_finetune=params.get('fraction_layers_to_finetune', self.fraction_layers_to_finetune),
+            logistic_C=params.get('logistic_C', self.logistic_C),
+            logistic_max_iter=params.get('logistic_max_iter', self.logistic_max_iter),
+        )
+        
+        # Create temporary DataFrames
+        train_df = pd.DataFrame({
+            'text': self.train_texts,
+            'label': self.train_labels
+        })
+        val_df = pd.DataFrame({
+            'text': self.val_texts,
+            'label': self.val_labels
+        })
+        
+        try:
+            # Train and evaluate
+            val_error = temp_automl.fit(train_df, val_df, self.num_classes)
+            logger.info(f"Trial {trial.number}: val_error = {val_error:.4f}")
+            return val_error
+        except Exception as e:
+            logger.warning(f"Trial {trial.number} failed: {e}")
+            return float('inf')
 
-    for layer in model.distilbert.transformer.layer[:layers_to_freeze]:
-        for param in layer.parameters():
-            param.requires_grad = False
+    def optimize_hyperparameters(self, n_trials=20, timeout=3600):
+        """Run hyperparameter optimization using Optuna."""
+        if not OPTUNA_AVAILABLE:
+            raise ImportError("Optuna is required for HPO. Install with: pip install optuna")
+            
+        logger.info(f"Starting HPO for {self.approach} with {n_trials} trials (timeout: {timeout}s)")
+        
+        study = optuna.create_study(
+            direction='minimize',
+            sampler=TPESampler(seed=self.seed),
+            study_name=f"hpo_{self.approach}_{self.seed}"
+        )
+        
+        study.optimize(
+            self._hpo_objective,
+            n_trials=n_trials,
+            timeout=timeout,
+            show_progress_bar=True
+        )
+        
+        best_params = study.best_params
+        logger.info(f"HPO completed. Best params: {best_params}")
+        logger.info(f"Best validation error: {study.best_value:.4f}")
+        
+        # Update instance with best parameters
+        for param, value in best_params.items():
+            if hasattr(self, param):
+                setattr(self, param, value)
+                
+        return study.best_value, best_params
+
+    def fit_with_hpo(
+        self, 
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame, 
+        num_classes: int,
+        n_trials: int = 20,
+        timeout: int = 3600,
+        **kwargs
+    ):
+        """Fit model with hyperparameter optimization."""
+        logger.info("Starting fit_with_hpo...")
+        
+        # Store data for HPO
+        self.train_texts = train_df['text'].tolist()
+        self.train_labels = train_df['label'].tolist()
+        self.val_texts = val_df['text'].tolist()
+        self.val_labels = val_df['label'].tolist()
+        self.num_classes = num_classes
+        
+        # Run HPO
+        best_score, best_params = self.optimize_hyperparameters(n_trials, timeout)
+        
+        # Final training with best parameters
+        logger.info("Training final model with optimized hyperparameters...")
+        final_score = self.fit(train_df, val_df, num_classes, **kwargs)
+        
+        logger.info(f"HPO completed. Final validation error: {final_score:.4f}")
+        return final_score
+
+    def _freeze_layers(self, model, fraction_layers_to_finetune: float = 1.0) -> None:
+        """Freeze layers in transformer model for partial fine-tuning."""
+        total_layers = len(model.distilbert.transformer.layer)
+        _num_layers_to_finetune = int(fraction_layers_to_finetune * total_layers)
+        layers_to_freeze = total_layers - _num_layers_to_finetune
+
+        for layer in model.distilbert.transformer.layer[:layers_to_freeze]:
+            for param in layer.parameters():
+                param.requires_grad = False
+                
+        logger.info(f"Froze {layers_to_freeze}/{total_layers} layers, fine-tuning {_num_layers_to_finetune} layers")
+
 # end of file

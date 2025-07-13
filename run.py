@@ -3,8 +3,16 @@
 You are not expected to follow this script or be constrained to it.
 
 For a test run:
-1) Download datasets (see, README) at chosen path
-2) Run the script: 
+1) Download datasets (see, README) at chosen pat    parser.add_argument(
+        "--approach",
+        type=str,
+        default="transformer",
+        choices=["tfidf", "lstm", "transformer", "logistic"],
+        help=(
+            "The approach to use for the AutoML system. "
+            "Options are 'tfidf', 'lstm', 'transformer', or 'logistic'."
+        )
+    )he script: 
 ```
 python run.py \
     --data-path <path-to-downloaded-data> \
@@ -54,6 +62,9 @@ def main_loop(
         fraction_layers_to_finetune: float = 1.0,
         data_fraction: int = 1.0,
         load_path: Path = None,
+        use_hpo: bool = False,
+        hpo_trials: int = 20,
+        hpo_timeout: int = 3600,
     ) -> None:
     match dataset:
         case "ag_news":
@@ -111,13 +122,24 @@ def main_loop(
     )
 
     # Fit the AutoML model on the training and validation datasets
-    val_err = automl.fit(
-        train_df,
-        val_df,
-        num_classes=num_classes,
-        load_path=load_path,
-        save_path=output_path,
-    )
+    if use_hpo:
+        val_err = automl.fit_with_hpo(
+            train_df,
+            val_df,
+            num_classes=num_classes,
+            n_trials=hpo_trials,
+            timeout=hpo_timeout,
+            load_path=load_path,
+            save_path=output_path,
+        )
+    else:
+        val_err = automl.fit(
+            train_df,
+            val_df,
+            num_classes=num_classes,
+            load_path=load_path,
+            save_path=output_path,
+        )
     logger.info("Training complete")
 
     # Predict on the test set
@@ -204,10 +226,10 @@ if __name__ == "__main__":
         "--approach",
         type=str,
         default="transformer",
-        choices=["tfidf", "lstm", "transformer"],
+        choices=["ffnn", "logistic", "lstm", "transformer"],
         help=(
             "The approach to use for the AutoML system. "
-            "Options are 'tfidf', 'lstm', or 'transformer'."
+            "Options are 'tfidf', 'logistic', 'lstm', or 'transformer'."
         )
     )
     parser.add_argument(
@@ -274,6 +296,23 @@ if __name__ == "__main__":
         default=1,
         help="Subsampling of training set, in fraction (0, 1]."
     )
+    parser.add_argument(
+        "--use-hpo",
+        action="store_true",
+        help="Enable hyperparameter optimization using Optuna."
+    )
+    parser.add_argument(
+        "--hpo-trials",
+        type=int,
+        default=20,
+        help="Number of trials for hyperparameter optimization."
+    )
+    parser.add_argument(
+        "--hpo-timeout",
+        type=int,
+        default=3600,
+        help="Timeout in seconds for hyperparameter optimization."
+    )
     args = parser.parse_args()
 
     logger.info(f"Running text dataset {args.dataset}\n{args}")
@@ -309,6 +348,9 @@ if __name__ == "__main__":
         lstm_emb_dim=args.lstm_emb_dim,
         lstm_hidden_dim=args.lstm_hidden_dim,
         data_fraction=args.data_fraction,
-        load_path=Path(args.load_path) if args.load_path is not None else None
+        load_path=Path(args.load_path) if args.load_path is not None else None,
+        use_hpo=args.use_hpo,
+        hpo_trials=args.hpo_trials,
+        hpo_timeout=args.hpo_timeout,
     )
 # end of file
