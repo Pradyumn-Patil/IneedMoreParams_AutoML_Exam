@@ -438,6 +438,9 @@ class TextAutoML:
         """Objective function for Optuna hyperparameter optimization."""
         params = self._create_hpo_search_space(trial)
         
+        # Log the hyperparameters for this trial
+        logger.info(f"Trial {trial.number} hyperparameters: {params}")
+        
         # Create temporary AutoML instance with suggested parameters
         temp_automl = TextAutoML(
             seed=self.seed,
@@ -513,6 +516,7 @@ class TextAutoML:
         num_classes: int,
         n_trials: int = 20,
         timeout: int = 3600,
+        save_path: Path = None,
         **kwargs
     ):
         """Fit model with hyperparameter optimization."""
@@ -530,7 +534,7 @@ class TextAutoML:
         
         # Final training with best parameters
         logger.info("Training final model with optimized hyperparameters...")
-        final_score = self.fit(train_df, val_df, num_classes, **kwargs)
+        final_score = self.fit(train_df, val_df, num_classes, save_path=save_path, **kwargs)
         
         logger.info(f"HPO completed. Final validation error: {final_score:.4f}")
         return final_score
