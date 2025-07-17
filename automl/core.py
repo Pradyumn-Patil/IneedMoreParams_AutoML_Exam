@@ -312,13 +312,19 @@ class TextAutoML:
             save_path = Path(save_path) if not isinstance(save_path, Path) else save_path
             save_path.mkdir(parents=True, exist_ok=True)
 
+            # Use trial-specific checkpoint name if this is during HPO
+            if hasattr(self, 'trial_number'):
+                checkpoint_name = f"checkpoint_trial_{self.trial_number}.pth"
+            else:
+                checkpoint_name = "checkpoint.pth"
+
             torch.save(
                 {
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "epoch": epoch,
                 },
-                save_path / "checkpoint.pth"
+                save_path / checkpoint_name
             )   
         torch.cuda.empty_cache()
         return val_acc or 0.0
@@ -434,7 +440,7 @@ class TextAutoML:
             
         return params
 
-    def _hpo_objective(self, trial):
+    def _hpo_objective(self, trial, save_path=None):
         """Objective function for Optuna hyperparameter optimization."""
         params = self._create_hpo_search_space(trial)
         
@@ -470,15 +476,21 @@ class TextAutoML:
         })
         
         try:
-            # Train and evaluate
-            val_error = temp_automl.fit(train_df, val_df, self.num_classes)
+            # Train and evaluate with checkpoint saving
+            if save_path is not None:
+                # Set trial number for checkpoint naming
+                temp_automl.trial_number = trial.number
+                val_error = temp_automl.fit(train_df, val_df, self.num_classes, save_path=save_path)
+            else:
+                val_error = temp_automl.fit(train_df, val_df, self.num_classes)
+                
             logger.info(f"Trial {trial.number}: val_error = {val_error:.4f}")
             return val_error
         except Exception as e:
             logger.warning(f"Trial {trial.number} failed: {e}")
             return float('inf')
 
-    def optimize_hyperparameters(self, n_trials=20, timeout=3600):
+    def optimize_hyperparameters(self, n_trials=20, timeout=3600, save_path=None):
         """Run hyperparameter optimization using Optuna."""
         if not OPTUNA_AVAILABLE:
             raise ImportError("Optuna is required for HPO. Install with: pip install optuna")
@@ -492,7 +504,7 @@ class TextAutoML:
         )
         
         study.optimize(
-            self._hpo_objective,
+            lambda trial: self._hpo_objective(trial, save_path=save_path),
             n_trials=n_trials,
             timeout=timeout,
             show_progress_bar=True
@@ -530,7 +542,7 @@ class TextAutoML:
         self.num_classes = num_classes
         
         # Run HPO
-        best_score, best_params = self.optimize_hyperparameters(n_trials, timeout)
+        best_score, best_params = self.optimize_hyperparameters(n_trials, timeout, save_path)
         
         # Final training with best parameters
         logger.info("Training final model with optimized hyperparameters...")
