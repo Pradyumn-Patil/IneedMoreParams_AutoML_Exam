@@ -264,11 +264,39 @@ class TextAutoML:
         start_epoch = 0
         # handling checkpoint resume
         if load_path is not None:
-            _states = torch.load(load_path / "checkpoint.pth", map_location='cpu')  # Load to CPU first
-            self.model.load_state_dict(_states["model_state_dict"])
-            optimizer.load_state_dict(_states["optimizer_state_dict"])
-            start_epoch = _states["epoch"]
-            logger.info(f"Resuming from checkpoint at {start_epoch}")
+            # Try to find checkpoint file
+            checkpoint_files = list(Path(load_path).glob("checkpoint*.pth"))
+            if checkpoint_files:
+                # Prioritize checkpoint selection
+                checkpoint_file = None
+                
+                # First, check if there's a generic checkpoint.pth (for non-HPO usage)
+                generic_checkpoint = Path(load_path) / "checkpoint.pth"
+                if generic_checkpoint.exists():
+                    checkpoint_file = generic_checkpoint
+                    logger.info("Found generic checkpoint.pth, using for resume")
+                else:
+                    # No generic checkpoint, look for trial-specific ones (HPO usage)
+                    trial_files = [f for f in checkpoint_files if "trial_" in f.name]
+                    if trial_files:
+                        # Files are zero-padded, so alphabetical sort = numerical sort
+                        trial_files.sort()
+                        checkpoint_file = trial_files[-1]  # Use the latest trial
+                        logger.info(f"Found trial checkpoints, using latest: {checkpoint_file.name}")
+                    else:
+                        # Fallback to any checkpoint file
+                        checkpoint_files.sort()
+                        checkpoint_file = checkpoint_files[-1]
+                        logger.info(f"Using fallback checkpoint: {checkpoint_file.name}")
+                
+                logger.info(f"Loading checkpoint from: {checkpoint_file}")
+                _states = torch.load(checkpoint_file, map_location='cpu')
+                self.model.load_state_dict(_states["model_state_dict"])
+                optimizer.load_state_dict(_states["optimizer_state_dict"])
+                start_epoch = _states["epoch"]
+                logger.info(f"Resuming from checkpoint at epoch {start_epoch}")
+            else:
+                logger.warning(f"No checkpoint files found in {load_path}")
 
         for epoch in range(start_epoch, self.epochs):            
             total_loss = 0
@@ -319,7 +347,7 @@ class TextAutoML:
 
             # Use trial-specific checkpoint name if this is during HPO
             if hasattr(self, 'trial_number'):
-                checkpoint_name = f"checkpoint_trial_{self.trial_number}.pth"
+                checkpoint_name = f"checkpoint_trial_{self.trial_number:02d}.pth"  # Zero-padded 2 digits
             else:
                 checkpoint_name = "checkpoint.pth"
 
@@ -515,13 +543,38 @@ class TextAutoML:
             
         sampler_obj = samplers[sampler_name]
         logger.info(f"Using {sampler_name.upper()} sampler for HPO")
-        logger.info(f"Starting HPO for {self.approach} with {n_trials} trials (timeout: {timeout}s)")
         
-        study = optuna.create_study(
-            direction='minimize',
-            sampler=sampler_obj,
-            study_name=f"hpo_{self.approach}_{self.seed}"
-        )
+        # Create study with persistent storage
+        study_name = f"hpo_{self.approach}_{self.seed}"
+        if save_path is not None:
+            # Use SQLite database for persistence
+            storage_url = f"sqlite:///{save_path}/optuna_study.db"
+            try:
+                # Try to load existing study
+                study = optuna.load_study(
+                    study_name=study_name,
+                    storage=storage_url
+                )
+                logger.info(f"Resumed existing study with {len(study.trials)} completed trials")
+            except KeyError:
+                # Create new study if it doesn't exist
+                study = optuna.create_study(
+                    direction='minimize',
+                    sampler=sampler_obj,
+                    study_name=study_name,
+                    storage=storage_url
+                )
+                logger.info("Created new study")
+        else:
+            # In-memory study (no persistence)
+            study = optuna.create_study(
+                direction='minimize',
+                sampler=sampler_obj,
+                study_name=study_name
+            )
+            logger.info("Created in-memory study (no persistence)")
+            
+        logger.info(f"Starting HPO for {self.approach} with {n_trials} trials (timeout: {timeout}s)")
         
         study.optimize(
             lambda trial: self._hpo_objective(trial, save_path=save_path),
