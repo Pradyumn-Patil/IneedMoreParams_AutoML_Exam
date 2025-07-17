@@ -3,21 +3,17 @@
 You are not expected to follow this script or be constrained to it.
 
 For a test run:
-1) Download datasets (see, README) at chosen pat    parser.add_argument(
-        "--approach",
-        type=str,
-        default="transformer",
-        choices=["tfidf", "lstm", "transformer", "logistic"],
-        help=(
-            "The approach to use for the AutoML system. "
-            "Options are 'tfidf', 'lstm', 'transformer', or 'logistic'."
-        )
-    )he script: 
+1) Download datasets (see, README) at chosen path
+2) Run the script: 
 ```
-python run.py \
-    --data-path <path-to-downloaded-data> \
-    --dataset amazon \
-    --epochs 1
+# Basic training
+python run.py --data-path <path-to-downloaded-data> --dataset amazon --epochs 1
+
+# HPO with different samplers
+python run.py --data-path <path-to-downloaded-data> --dataset amazon --use-hpo --hpo-trials 50 --hpo-sampler tpe
+python run.py --data-path <path-to-downloaded-data> --dataset amazon --use-hpo --hpo-trials 50 --hpo-sampler random
+python run.py --data-path <path-to-downloaded-data> --dataset amazon --use-hpo --hpo-trials 50 --hpo-sampler cmaes
+python run.py --data-path <path-to-downloaded-data> --dataset amazon --use-hpo --hpo-trials 50 --hpo-sampler nsga2
 ```
 
 """
@@ -65,6 +61,7 @@ def main_loop(
         use_hpo: bool = False,
         hpo_trials: int = 20,
         hpo_timeout: int = 3600,
+        hpo_sampler: str = 'tpe',
     ) -> None:
     match dataset:
         case "ag_news":
@@ -129,6 +126,7 @@ def main_loop(
             num_classes=num_classes,
             n_trials=hpo_trials,
             timeout=hpo_timeout,
+            sampler=hpo_sampler,
             load_path=load_path,
             save_path=output_path,
         )
@@ -313,6 +311,14 @@ if __name__ == "__main__":
         default=3600,
         help="Timeout in seconds for hyperparameter optimization."
     )
+    parser.add_argument(
+        "--hpo-sampler",
+        type=str,
+        default="tpe",
+        choices=["tpe", "random", "cmaes", "nsga2"],
+        help="Sampler type for hyperparameter optimization."
+    )
+
     args = parser.parse_args()
 
     logger.info(f"Running text dataset {args.dataset}\n{args}")
@@ -352,5 +358,6 @@ if __name__ == "__main__":
         use_hpo=args.use_hpo,
         hpo_trials=args.hpo_trials,
         hpo_timeout=args.hpo_timeout,
+        hpo_sampler=args.hpo_sampler,
     )
 # end of file

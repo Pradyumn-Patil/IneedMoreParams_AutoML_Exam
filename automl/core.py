@@ -16,7 +16,7 @@ from collections import Counter
 
 try:
     import optuna
-    from optuna.samplers import TPESampler
+    from optuna.samplers import TPESampler, RandomSampler, CmaEsSampler, NSGAIISampler
     OPTUNA_AVAILABLE = True
 except ImportError:
     OPTUNA_AVAILABLE = False
@@ -47,6 +47,8 @@ class TextAutoML:
         # LogisticRegression parameters
         logistic_C=1.0, # Regularization strength
         logistic_max_iter=1000,
+        # HPO parameters
+        hpo_sampler='tpe',  # 'tpe', 'random', 'cmaes', 'nsga2'
     ):
         self.seed = seed
         np.random.seed(seed)
@@ -69,6 +71,9 @@ class TextAutoML:
         # LogisticRegression parameters
         self.logistic_C = logistic_C
         self.logistic_max_iter = logistic_max_iter
+        
+        # HPO parameters
+        self.hpo_sampler = hpo_sampler
 
         self.model = None
         self.tokenizer = None
@@ -490,16 +495,31 @@ class TextAutoML:
             logger.warning(f"Trial {trial.number} failed: {e}")
             return float('inf')
 
-    def optimize_hyperparameters(self, n_trials=20, timeout=3600, save_path=None):
+    def optimize_hyperparameters(self, n_trials=20, timeout=3600, save_path=None, sampler=None):
         """Run hyperparameter optimization using Optuna."""
         if not OPTUNA_AVAILABLE:
             raise ImportError("Optuna is required for HPO. Install with: pip install optuna")
             
+        # Select sampler
+        sampler_name = sampler or self.hpo_sampler
+        samplers = {
+            'tpe': TPESampler(seed=self.seed),
+            'random': RandomSampler(seed=self.seed),
+            'cmaes': CmaEsSampler(seed=self.seed),
+            'nsga2': NSGAIISampler(seed=self.seed)
+        }
+        
+        if sampler_name not in samplers:
+            logger.warning(f"Unknown sampler '{sampler_name}', falling back to TPE")
+            sampler_name = 'tpe'
+            
+        sampler_obj = samplers[sampler_name]
+        logger.info(f"Using {sampler_name.upper()} sampler for HPO")
         logger.info(f"Starting HPO for {self.approach} with {n_trials} trials (timeout: {timeout}s)")
         
         study = optuna.create_study(
             direction='minimize',
-            sampler=TPESampler(seed=self.seed),
+            sampler=sampler_obj,
             study_name=f"hpo_{self.approach}_{self.seed}"
         )
         
@@ -529,6 +549,7 @@ class TextAutoML:
         n_trials: int = 20,
         timeout: int = 3600,
         save_path: Path = None,
+        sampler: str = None,
         **kwargs
     ):
         """Fit model with hyperparameter optimization."""
@@ -542,7 +563,7 @@ class TextAutoML:
         self.num_classes = num_classes
         
         # Run HPO
-        best_score, best_params = self.optimize_hyperparameters(n_trials, timeout, save_path)
+        best_score, best_params = self.optimize_hyperparameters(n_trials, timeout, save_path, sampler)
         
         # Final training with best parameters
         logger.info("Training final model with optimized hyperparameters...")
