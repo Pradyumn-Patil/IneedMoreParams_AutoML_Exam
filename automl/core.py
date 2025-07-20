@@ -17,6 +17,7 @@ from collections import Counter
 try:
     import optuna
     from optuna.samplers import TPESampler, RandomSampler, CmaEsSampler, NSGAIISampler
+    from optuna.pruners import MedianPruner, SuccessiveHalvingPruner, HyperbandPruner
     OPTUNA_AVAILABLE = True
 except ImportError:
     OPTUNA_AVAILABLE = False
@@ -49,6 +50,8 @@ class TextAutoML:
         logistic_max_iter=1000,
         # HPO parameters
         hpo_sampler='tpe',  # 'tpe', 'random', 'cmaes', 'nsga2'
+        hpo_pruner='median',  # 'median', 'successive_halving', 'hyperband'
+        use_multi_fidelity=True,  # Enable/disable multi-fidelity optimization
     ):
         self.seed = seed
         np.random.seed(seed)
@@ -74,6 +77,8 @@ class TextAutoML:
         
         # HPO parameters
         self.hpo_sampler = hpo_sampler
+        self.hpo_pruner = hpo_pruner  # 'median', 'successive_halving', 'hyperband'
+        self.use_multi_fidelity = use_multi_fidelity  # Enable/disable multi-fidelity optimization
 
         self.model = None
         self.tokenizer = None
@@ -248,6 +253,7 @@ class TextAutoML:
                 val_loader,
                 load_path=load_path,
                 save_path=save_path,
+                trial=getattr(self, 'current_trial', None),  # Pass trial for multi-fidelity
             )
             return 1 - val_acc
 
@@ -257,6 +263,7 @@ class TextAutoML:
         val_loader: DataLoader,
         load_path: Path=None,
         save_path: Path=None,
+        trial=None,  # For multi-fidelity HPO
     ):
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         criterion = nn.CrossEntropyLoss()
@@ -331,7 +338,31 @@ class TextAutoML:
 
             logger.info(f"Epoch {epoch + 1}, Loss: {total_loss:.4f}")
 
-            if self.val_texts:
+            # Multi-fidelity HPO: report intermediate values and check for pruning
+            if trial is not None and self.val_texts and self.use_multi_fidelity:
+                val_preds, val_labels = self._predict(val_loader)
+                val_acc = accuracy_score(val_labels, val_preds)
+                val_error = 1 - val_acc
+                
+                # Report intermediate value to Optuna for pruning
+                trial.report(val_error, epoch)
+                    
+                # Check if trial should be pruned
+                if trial.should_prune():
+                    # Get study to compare with other trials
+                    study = trial.study
+                    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+                    
+                    # Concise pruning log
+                    best_error = min(t.value for t in completed_trials) if completed_trials else "N/A"
+                    logger.info(f"Trial #{trial.number} PRUNED at epoch {epoch + 1} | "
+                              f"Error: {val_error:.4f} | Pruner: {self.hpo_pruner} | "
+                              f"Best so far: {best_error if best_error == 'N/A' else f'{best_error:.4f}'}")
+                    
+                    raise optuna.exceptions.TrialPruned()
+                
+                logger.info(f"Trial {trial.number} continues - performance is promising")
+            elif self.val_texts:
                 val_preds, val_labels = self._predict(val_loader)
                 val_acc = accuracy_score(val_labels, val_preds)
                 logger.info(f"Epoch {epoch + 1}, Validation Accuracy: {val_acc:.4f}")
@@ -451,7 +482,7 @@ class TextAutoML:
             params['weight_decay'] = trial.suggest_float('weight_decay', 0.0, 0.1)
             params['batch_size'] = trial.suggest_categorical('batch_size', [16, 32, 64, 128])
             params['ffnn_hidden'] = trial.suggest_int('ffnn_hidden', 64, 512)
-            params['epochs'] = trial.suggest_int('epochs', 3, 10)
+            params['epochs'] = trial.suggest_int('epochs', 3, 15)
             params['vocab_size'] = trial.suggest_int('vocab_size', 5000, 20000)
             
         elif self.approach == 'lstm':
@@ -460,7 +491,7 @@ class TextAutoML:
             params['batch_size'] = trial.suggest_categorical('batch_size', [16, 32, 64])
             params['lstm_emb_dim'] = trial.suggest_int('lstm_emb_dim', 64, 256)
             params['lstm_hidden_dim'] = trial.suggest_int('lstm_hidden_dim', 64, 256)
-            params['epochs'] = trial.suggest_int('epochs', 3, 10)
+            params['epochs'] = trial.suggest_int('epochs', 3, 15)
             params['token_length'] = trial.suggest_int('token_length', 64, 256)
             
         elif self.approach == 'transformer':
@@ -468,7 +499,7 @@ class TextAutoML:
             params['weight_decay'] = trial.suggest_float('weight_decay', 0.0, 0.1)
             params['batch_size'] = trial.suggest_categorical('batch_size', [8, 16, 32])
             params['fraction_layers_to_finetune'] = trial.suggest_float('fraction_layers_to_finetune', 0.1, 1.0)
-            params['epochs'] = trial.suggest_int('epochs', 2, 5)
+            params['epochs'] = trial.suggest_int('epochs', 2, 8)
             params['token_length'] = trial.suggest_int('token_length', 128, 512)
             
         return params
@@ -509,6 +540,9 @@ class TextAutoML:
         })
         
         try:
+            # Set current trial for multi-fidelity HPO
+            temp_automl.current_trial = trial
+            
             # Train and evaluate with checkpoint saving
             if save_path is not None:
                 # Set trial number for checkpoint naming
@@ -519,12 +553,15 @@ class TextAutoML:
                 
             logger.info(f"Trial {trial.number}: val_error = {val_error:.4f}")
             return val_error
+        except optuna.exceptions.TrialPruned:
+            # Re-raise pruned exception to be handled by Optuna
+            raise
         except Exception as e:
             logger.warning(f"Trial {trial.number} failed: {e}")
             return float('inf')
 
-    def optimize_hyperparameters(self, n_trials=20, timeout=3600, save_path=None, sampler=None):
-        """Run hyperparameter optimization using Optuna."""
+    def optimize_hyperparameters(self, n_trials=20, timeout=3600, save_path=None, sampler=None, pruner=None):
+        """Run hyperparameter optimization using Optuna (optionally with multi-fidelity support)."""
         if not OPTUNA_AVAILABLE:
             raise ImportError("Optuna is required for HPO. Install with: pip install optuna")
             
@@ -544,6 +581,27 @@ class TextAutoML:
         sampler_obj = samplers[sampler_name]
         logger.info(f"Using {sampler_name.upper()} sampler for HPO")
         
+        # Select pruner for multi-fidelity optimization
+        pruner_obj = None
+        if self.use_multi_fidelity:
+            pruner_name = pruner or getattr(self, 'hpo_pruner', 'median')
+            
+            # Create only the selected pruner to save memory
+            if pruner_name == 'median':
+                pruner_obj = MedianPruner(n_startup_trials=5, n_warmup_steps=2)
+            elif pruner_name == 'successive_halving':
+                pruner_obj = SuccessiveHalvingPruner(min_resource=2, reduction_factor=2)
+            elif pruner_name == 'hyperband':
+                pruner_obj = HyperbandPruner(min_resource=2, max_resource='auto', reduction_factor=3)
+            else:
+                logger.warning(f"Unknown pruner '{pruner_name}', falling back to median")
+                pruner_name = 'median'
+                pruner_obj = MedianPruner(n_startup_trials=5, n_warmup_steps=2)
+                
+            logger.info(f"Using {pruner_name.upper()} pruner for multi-fidelity HPO")
+        else:
+            logger.info("Multi-fidelity optimization disabled - using standard HPO")
+        
         # Create study with persistent storage
         study_name = f"hpo_{self.approach}_{self.seed}"
         if save_path is not None:
@@ -561,20 +619,31 @@ class TextAutoML:
                 study = optuna.create_study(
                     direction='minimize',
                     sampler=sampler_obj,
+                    pruner=pruner_obj,
                     study_name=study_name,
                     storage=storage_url
                 )
-                logger.info("Created new study")
+                if self.use_multi_fidelity:
+                    logger.info("Created new study with multi-fidelity pruning")
+                else:
+                    logger.info("Created new study without pruning")
         else:
             # In-memory study (no persistence)
             study = optuna.create_study(
                 direction='minimize',
                 sampler=sampler_obj,
+                pruner=pruner_obj,
                 study_name=study_name
             )
-            logger.info("Created in-memory study (no persistence)")
+            if self.use_multi_fidelity:
+                logger.info("Created in-memory study with multi-fidelity pruning")
+            else:
+                logger.info("Created in-memory study without pruning")
             
-        logger.info(f"Starting HPO for {self.approach} with {n_trials} trials (timeout: {timeout}s)")
+        if self.use_multi_fidelity:
+            logger.info(f"Starting multi-fidelity HPO for {self.approach} with {n_trials} trials (timeout: {timeout}s)")
+        else:
+            logger.info(f"Starting standard HPO for {self.approach} with {n_trials} trials (timeout: {timeout}s)")
         
         study.optimize(
             lambda trial: self._hpo_objective(trial, save_path=save_path),
@@ -584,8 +653,14 @@ class TextAutoML:
         )
         
         best_params = study.best_params
-        logger.info(f"HPO completed. Best params: {best_params}")
-        logger.info(f"Best validation error: {study.best_value:.4f}")
+        if self.use_multi_fidelity:
+            logger.info(f"Multi-fidelity HPO completed. Best params: {best_params}")
+            logger.info(f"Best validation error: {study.best_value:.4f}")
+            logger.info(f"Total trials: {len(study.trials)}, Pruned trials: {len([t for t in study.trials if t.state == optuna.trial.TrialState.PRUNED])}")
+        else:
+            logger.info(f"Standard HPO completed. Best params: {best_params}")
+            logger.info(f"Best validation error: {study.best_value:.4f}")
+            logger.info(f"Total trials: {len(study.trials)}")
         
         # Update instance with best parameters
         for param, value in best_params.items():
@@ -603,10 +678,18 @@ class TextAutoML:
         timeout: int = 3600,
         save_path: Path = None,
         sampler: str = None,
+        pruner: str = None,  # For multi-fidelity HPO
+        use_multi_fidelity: bool = None,  # Enable/disable multi-fidelity
         **kwargs
     ):
-        """Fit model with hyperparameter optimization."""
-        logger.info("Starting fit_with_hpo...")
+        """Fit model with hyperparameter optimization (optionally multi-fidelity)."""
+        if use_multi_fidelity is not None:
+            self.use_multi_fidelity = use_multi_fidelity
+            
+        if self.use_multi_fidelity:
+            logger.info("Starting fit_with_hpo with multi-fidelity optimization...")
+        else:
+            logger.info("Starting fit_with_hpo with standard optimization...")
         
         # Store data for HPO
         self.train_texts = train_df['text'].tolist()
@@ -615,14 +698,17 @@ class TextAutoML:
         self.val_labels = val_df['label'].tolist()
         self.num_classes = num_classes
         
-        # Run HPO
-        best_score, best_params = self.optimize_hyperparameters(n_trials, timeout, save_path, sampler)
+        # Run HPO (with or without multi-fidelity)
+        best_score, best_params = self.optimize_hyperparameters(n_trials, timeout, save_path, sampler, pruner)
         
         # Final training with best parameters
         logger.info("Training final model with optimized hyperparameters...")
         final_score = self.fit(train_df, val_df, num_classes, save_path=save_path, **kwargs)
         
-        logger.info(f"HPO completed. Final validation error: {final_score:.4f}")
+        if self.use_multi_fidelity:
+            logger.info(f"Multi-fidelity HPO completed. Final validation error: {final_score:.4f}")
+        else:
+            logger.info(f"Standard HPO completed. Final validation error: {final_score:.4f}")
         return final_score
 
     def _freeze_layers(self, model, fraction_layers_to_finetune: float = 1.0) -> None:

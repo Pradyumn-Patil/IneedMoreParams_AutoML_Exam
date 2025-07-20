@@ -62,6 +62,8 @@ def main_loop(
         hpo_trials: int = 20,
         hpo_timeout: int = 3600,
         hpo_sampler: str = 'tpe',
+        hpo_pruner: str = 'median',
+        use_multi_fidelity: bool = False,
     ) -> None:
     match dataset:
         case "ag_news":
@@ -116,6 +118,9 @@ def main_loop(
         lstm_emb_dim=lstm_emb_dim,
         lstm_hidden_dim=lstm_hidden_dim,
         fraction_layers_to_finetune=fraction_layers_to_finetune,
+        hpo_sampler=hpo_sampler,
+        hpo_pruner=hpo_pruner,
+        use_multi_fidelity=use_multi_fidelity,
     )
 
     # Fit the AutoML model on the training and validation datasets
@@ -257,7 +262,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lr",
         type=float,
-        default=0.01,
+        default=0.0001,
         help="The learning rate to use for the optimizer."
     )
     parser.add_argument(
@@ -318,6 +323,18 @@ if __name__ == "__main__":
         choices=["tpe", "random", "cmaes", "nsga2"],
         help="Sampler type for hyperparameter optimization."
     )
+    parser.add_argument(
+        "--hpo-pruner",
+        type=str,
+        default="median",
+        choices=["median", "successive_halving", "hyperband"],
+        help="Pruner type for multi-fidelity hyperparameter optimization."
+    )
+    parser.add_argument(
+        "--use-multi-fidelity",
+        action="store_true",
+        help="Enable multi-fidelity optimization with pruning."
+    )
 
     args = parser.parse_args()
 
@@ -359,5 +376,7 @@ if __name__ == "__main__":
         hpo_trials=args.hpo_trials,
         hpo_timeout=args.hpo_timeout,
         hpo_sampler=args.hpo_sampler,
+        hpo_pruner=args.hpo_pruner,
+        use_multi_fidelity=args.use_multi_fidelity,
     )
 # end of file
