@@ -1,0 +1,57 @@
+# Baseline Configuration for AutoML Text Classification
+# This file defines the baseline experiments to run
+
+experiment_name: "baseline_experiments"
+description: "Baseline performance evaluation for 4 datasets × 4 approaches"
+
+# Global settings
+global_settings: # run.py default values
+  seed: 42
+  data_path: null  #override with --data-path argument
+  vocab_size: 1000
+  token_length: 128
+  epochs: 5
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.01
+  lstm-emb-dim: 64
+  lstm-hidden-dim: 64
+  ffnn-hidden-layer-dim: 64
+  data_fraction: 1.0
+  use_hpo: false
+
+# Dataset and approach combinations to test
+experiments:
+  datasets:
+    - ag_news
+    - amazon 
+    - dbpedia
+    - imdb
+  
+  approaches:
+    - ffnn
+    - logistic
+    - lstm
+    - transformer
+
+# Approach-specific parameters (if different from global)
+approach_specific:
+  ffnn:
+    ffnn_hidden_layer_dim: 64
+  
+  lstm:
+    lstm_emb_dim: 64
+    lstm_hidden_dim: 64
+  
+  logistic: {}
+    # Uses default parameters
+
+  transformer: {}
+    # Uses default parameters
+
+# Output settings
+output:
+  base_path: "results/baseline"
+  save_predictions: true
+  save_scores: true
+  create_summary: true
