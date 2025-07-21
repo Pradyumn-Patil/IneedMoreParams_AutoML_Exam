@@ -7,7 +7,7 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-from automl.models import SimpleFFNN, LSTMClassifier
+from automl.models import SimpleFFNN, LSTMClassifier, NASSearchableFFNN, NASSearchableLSTM, NASSearchSpace
 from automl.utils import SimpleTextDataset
 from pathlib import Path
 import logging
@@ -79,6 +79,9 @@ class TextAutoML:
         self.hpo_sampler = hpo_sampler
         self.hpo_pruner = hpo_pruner  # 'median', 'successive_halving', 'hyperband'
         self.use_multi_fidelity = use_multi_fidelity  # Enable/disable multi-fidelity optimization
+        
+        # NAS parameters
+        self.use_nas = False  # Enable/disable neural architecture search
 
         self.model = None
         self.tokenizer = None
@@ -116,7 +119,7 @@ class TextAutoML:
         - val_df (pd.DataFrame): Validation data with 'text' and 'label' columns.
         - num_classes (int): Number of classes in the dataset.
         - seed (int): Random seed for reproducibility.
-        - approach (str): Model type - 'tfidf', 'lstm', or 'transformer'. Default is 'auto'.
+        - approach (str): Model type - 'ffnn', 'lstm', or 'transformer'. Default is 'auto'.
         - vocab_size (int): Maximum vocabulary size.
         - token_length (int): Maximum token sequence length.
         - epochs (int): Number of training epochs.
@@ -126,6 +129,12 @@ class TextAutoML:
         - ffnn_hidden (int): Hidden dimension size for FFNN.
         - lstm_emb_dim (int): Embedding dimension size for LSTM.
         - lstm_hidden_dim (int): Hidden dimension size for LSTM.
+        
+        Note: 
+        - This method performs basic model training without optimization.
+        - For hyperparameter optimization, use fit_with_hpo().
+        - For neural architecture search, use fit_with_nas().
+        - For combined optimization, use fit_with_nas_hpo().
         """
         if approach is not None: self.approach = approach
         if vocab_size is not None: self.vocab_size = vocab_size
@@ -465,6 +474,18 @@ class TextAutoML:
             raise ValueError(f"Unrecognized approach: {self.approach}")
             # handling any possible tokenization
 
+    def _freeze_layers(self, model, fraction_layers_to_finetune: float = 1.0) -> None:
+        """Freeze layers in transformer model for partial fine-tuning."""
+        total_layers = len(model.distilbert.transformer.layer)
+        _num_layers_to_finetune = int(fraction_layers_to_finetune * total_layers)
+        layers_to_freeze = total_layers - _num_layers_to_finetune
+
+        for layer in model.distilbert.transformer.layer[:layers_to_freeze]:
+            for param in layer.parameters():
+                param.requires_grad = False
+                
+        logger.info(f"Froze {layers_to_freeze}/{total_layers} layers, fine-tuning {_num_layers_to_finetune} layers")
+
     def _create_hpo_search_space(self, trial):
         """Create hyperparameter search space for the current approach."""
         if not OPTUNA_AVAILABLE:
@@ -506,6 +527,10 @@ class TextAutoML:
 
     def _hpo_objective(self, trial, save_path=None):
         """Objective function for Optuna hyperparameter optimization."""
+        # Check if this is combined NAS+HPO optimization
+        if getattr(self, 'use_nas', False):
+            return self._combined_nas_hpo_objective(trial, save_path)
+        
         params = self._create_hpo_search_space(trial)
         
         # Log the hyperparameters for this trial
@@ -567,18 +592,19 @@ class TextAutoML:
             
         # Select sampler
         sampler_name = sampler or self.hpo_sampler
-        samplers = {
-            'tpe': TPESampler(seed=self.seed),
-            'random': RandomSampler(seed=self.seed),
-            'cmaes': CmaEsSampler(seed=self.seed),
-            'nsga2': NSGAIISampler(seed=self.seed)
-        }
-        
-        if sampler_name not in samplers:
+        if sampler_name == 'tpe':
+            sampler_obj = TPESampler(seed=self.seed)
+        elif sampler_name == 'random':
+            sampler_obj = RandomSampler(seed=self.seed)
+        elif sampler_name == 'cmaes':
+            sampler_obj = CmaEsSampler(seed=self.seed)
+        elif sampler_name == 'nsga2':
+            sampler_obj = NSGAIISampler(seed=self.seed)
+        else:
             logger.warning(f"Unknown sampler '{sampler_name}', falling back to TPE")
             sampler_name = 'tpe'
+            sampler_obj = TPESampler(seed=self.seed)
             
-        sampler_obj = samplers[sampler_name]
         logger.info(f"Using {sampler_name.upper()} sampler for HPO")
         
         # Select pruner for multi-fidelity optimization
@@ -662,12 +688,7 @@ class TextAutoML:
             logger.info(f"Best validation error: {study.best_value:.4f}")
             logger.info(f"Total trials: {len(study.trials)}")
         
-        # Update instance with best parameters
-        for param, value in best_params.items():
-            if hasattr(self, param):
-                setattr(self, param, value)
-                
-        return study.best_value, best_params
+        return study.best_value, best_params, study
 
     def fit_with_hpo(
         self, 
@@ -682,7 +703,12 @@ class TextAutoML:
         use_multi_fidelity: bool = None,  # Enable/disable multi-fidelity
         **kwargs
     ):
-        """Fit model with hyperparameter optimization (optionally multi-fidelity)."""
+        """
+        Fit model with Hyperparameter Optimization only (no NAS).
+        
+        This method performs hyperparameter optimization without architecture search.
+        For combined NAS+HPO, use fit_with_nas_hpo() instead.
+        """
         if use_multi_fidelity is not None:
             self.use_multi_fidelity = use_multi_fidelity
             
@@ -690,6 +716,10 @@ class TextAutoML:
             logger.info("Starting fit_with_hpo with multi-fidelity optimization...")
         else:
             logger.info("Starting fit_with_hpo with standard optimization...")
+        
+        # Ensure NAS is disabled for HPO-only optimization
+        original_use_nas = getattr(self, 'use_nas', False)
+        self.use_nas = False
         
         # Store data for HPO
         self.train_texts = train_df['text'].tolist()
@@ -699,28 +729,373 @@ class TextAutoML:
         self.num_classes = num_classes
         
         # Run HPO (with or without multi-fidelity)
-        best_score, best_params = self.optimize_hyperparameters(n_trials, timeout, save_path, sampler, pruner)
+        best_score, best_params, study = self.optimize_hyperparameters(n_trials, timeout, save_path, sampler, pruner)
+        
+        # Apply best hyperparameters to current instance
+        logger.info("Applying best hyperparameters to current instance...")
+        for param, value in best_params.items():
+            if hasattr(self, param):
+                setattr(self, param, value)
         
         # Final training with best parameters
         logger.info("Training final model with optimized hyperparameters...")
         final_score = self.fit(train_df, val_df, num_classes, save_path=save_path, **kwargs)
         
+        # Restore original NAS setting
+        self.use_nas = original_use_nas
+        
         if self.use_multi_fidelity:
-            logger.info(f"Multi-fidelity HPO completed. Final validation error: {final_score:.4f}")
+            logger.info(f"HPO with multi-fidelity completed. Final validation error: {final_score:.4f}")
         else:
-            logger.info(f"Standard HPO completed. Final validation error: {final_score:.4f}")
+            logger.info(f"HPO completed. Final validation error: {final_score:.4f}")
         return final_score
 
-    def _freeze_layers(self, model, fraction_layers_to_finetune: float = 1.0) -> None:
-        """Freeze layers in transformer model for partial fine-tuning."""
-        total_layers = len(model.distilbert.transformer.layer)
-        _num_layers_to_finetune = int(fraction_layers_to_finetune * total_layers)
-        layers_to_freeze = total_layers - _num_layers_to_finetune
+    def fit_with_nas(
+        self,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        num_classes: int,
+        n_trials: int = 20,
+        timeout: int = 3600,
+        save_path: Path = None,
+        **kwargs
+    ):
+        """
+        Fit model with Neural Architecture Search only (no HPO).
+        
+        This method performs architecture search without optimizing other hyperparameters.
+        For combined NAS+HPO, use fit_with_nas_hpo() instead.
+        """
+        logger.info("Starting fit_with_nas with architecture search...")
+        
+        # Ensure HPO is disabled for NAS-only optimization
+        original_use_hpo = getattr(self, 'use_hpo', False)
+        self.use_hpo = False
+        
+        if not OPTUNA_AVAILABLE:
+            raise ImportError("Optuna is required for NAS. Install with: pip install optuna")
+            
+        if self.approach not in ['ffnn', 'lstm']:
+            raise ValueError(f"NAS is not supported for approach '{self.approach}'. Use 'ffnn' or 'lstm'.")
+            
+        logger.info(f"Starting NAS-only optimization for {self.approach} with {n_trials} trials...")
+        
+        # Store data for NAS
+        self.train_texts = train_df['text'].tolist()
+        self.train_labels = train_df['label'].tolist()
+        self.val_texts = val_df['text'].tolist()
+        self.val_labels = val_df['label'].tolist()
+        self.num_classes = num_classes
+        
+        # Run NAS
+        best_score, best_params, study = self.optimize_architectures(n_trials, timeout, save_path)
+        
+        # Apply best architecture to current instance
+        logger.info("Applying best architecture to current instance...")
+        train_df_for_nas = pd.DataFrame({
+            'text': self.train_texts,
+            'label': self.train_labels
+        })
+        val_df_for_nas = pd.DataFrame({
+            'text': self.val_texts,
+            'label': self.val_labels
+        })
+        self._setup_nas_model(study.best_trial, train_df_for_nas, val_df_for_nas)
+        
+        # Final training with best architecture (already applied by optimize_architectures)
+        logger.info("Training final model with optimized architecture...")
+        final_score = self.fit(train_df, val_df, num_classes, save_path=save_path, **kwargs)
+        
+        # Restore original HPO setting
+        self.use_hpo = original_use_hpo
+        
+        logger.info(f"NAS completed. Final validation error: {final_score:.4f}")
+        return final_score
 
-        for layer in model.distilbert.transformer.layer[:layers_to_freeze]:
-            for param in layer.parameters():
-                param.requires_grad = False
+    def _nas_objective(self, trial, train_df, val_df, save_path=None):
+        """Objective function for NAS-only optimization."""
+        # Create temporary AutoML instance with current hyperparameters (no HPO)
+        temp_automl = TextAutoML(
+            seed=self.seed,
+            approach=self.approach,
+            vocab_size=self.vocab_size,
+            token_length=self.token_length,
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+            ffnn_hidden=self.ffnn_hidden,
+            lstm_emb_dim=self.lstm_emb_dim,
+            lstm_hidden_dim=self.lstm_hidden_dim,
+            use_nas=True,  # Enable NAS
+        )
+        
+        try:
+            # Generate architecture for this trial
+            temp_automl._setup_nas_model(trial, train_df, val_df)
+            
+            # Train and evaluate
+            if save_path is not None:
+                temp_automl.trial_number = trial.number
+                val_error = temp_automl.fit(train_df, val_df, self.num_classes, save_path=save_path)
+            else:
+                val_error = temp_automl.fit(train_df, val_df, self.num_classes)
                 
-        logger.info(f"Froze {layers_to_freeze}/{total_layers} layers, fine-tuning {_num_layers_to_finetune} layers")
+            logger.info(f"NAS Trial {trial.number}: val_error = {val_error:.4f}")
+            return val_error
+            
+        except Exception as e:
+            logger.warning(f"NAS Trial {trial.number} failed: {e}")
+            return float('inf')
+
+    def optimize_architectures(self, n_trials=20, timeout=3600, save_path=None):
+        """Run neural architecture search using Optuna."""
+        if not OPTUNA_AVAILABLE:
+            raise ImportError("Optuna is required for NAS. Install with: pip install optuna")
+            
+        logger.info(f"Using TPE sampler for NAS")
+        
+        # Create study with persistent storage
+        study_name = f"nas_{self.approach}_{self.seed}"
+        if save_path is not None:
+            # Use SQLite database for persistence
+            storage_url = f"sqlite:///{save_path}/optuna_nas_study.db"
+            try:
+                # Try to load existing study
+                study = optuna.load_study(
+                    study_name=study_name,
+                    storage=storage_url
+                )
+                logger.info(f"Resumed existing NAS study with {len(study.trials)} completed trials")
+            except KeyError:
+                # Create new study if it doesn't exist
+                study = optuna.create_study(
+                    direction='minimize',
+                    sampler=TPESampler(seed=self.seed),
+                    study_name=study_name,
+                    storage=storage_url
+                )
+                logger.info("Created new NAS study")
+        else:
+            # In-memory study (no persistence)
+            study = optuna.create_study(
+                direction='minimize',
+                sampler=TPESampler(seed=self.seed),
+                study_name=study_name
+            )
+            logger.info("Created in-memory NAS study")
+            
+        logger.info(f"Starting NAS for {self.approach} with {n_trials} trials (timeout: {timeout}s)")
+        
+        # Create temporary DataFrames for the objective function
+        train_df = pd.DataFrame({
+            'text': self.train_texts,
+            'label': self.train_labels
+        })
+        val_df = pd.DataFrame({
+            'text': self.val_texts,
+            'label': self.val_labels
+        })
+        
+        study.optimize(
+            lambda trial: self._nas_objective(trial, train_df, val_df, save_path=save_path),
+            n_trials=n_trials,
+            timeout=timeout,
+            show_progress_bar=True
+        )
+        
+        best_params = study.best_params
+        logger.info(f"NAS completed. Best architecture: {best_params}")
+        logger.info(f"Best validation error: {study.best_value:.4f}")
+        logger.info(f"Total trials: {len(study.trials)}")
+        
+        return study.best_value, best_params, study
+
+    
+    def _setup_nas_model(self, trial, train_df, val_df):
+        """Setup NAS model based on trial architecture configuration."""
+        if self.approach == 'ffnn':
+            # Setup data processing for FFNN
+            self.vectorizer = TfidfVectorizer(
+                max_features=self.vocab_size,
+                lowercase=True,
+                min_df=2,
+                max_df=0.8,
+                sublinear_tf=True,
+                ngram_range=(1, 2),
+            )
+            X_train = self.vectorizer.fit_transform(train_df['text'].tolist()).toarray()
+            input_dim = X_train.shape[1]
+            
+            # Generate architecture
+            architecture_config = NASSearchSpace.generate_ffnn_architecture(trial, input_dim, self.num_classes)
+            logger.info(f"NAS FFNN Architecture: {architecture_config}")
+            
+            # Create model
+            self.model = NASSearchableFFNN(input_dim, self.num_classes, architecture_config)
+            self.nas_input_dim = input_dim
+            
+        elif self.approach == 'lstm':
+            # Setup tokenizer for LSTM
+            model_name = 'distilbert-base-uncased'
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            vocab_size = len(self.tokenizer)
+            
+            # Generate architecture
+            architecture_config = NASSearchSpace.generate_lstm_architecture(trial, vocab_size, self.num_classes)
+            logger.info(f"NAS LSTM Architecture: {architecture_config}")
+            
+            # Create model
+            self.model = NASSearchableLSTM(vocab_size, self.num_classes, architecture_config)
+    
+    def _combined_nas_hpo_objective(self, trial, save_path=None):
+        """Objective function for combined NAS+HPO optimization."""
+        # Create both hyperparameter and architecture search spaces
+        hpo_params = self._create_hpo_search_space(trial)
+        
+        # Log the parameters for this trial
+        logger.info(f"NAS+HPO Trial {trial.number} hyperparameters: {hpo_params}")
+        
+        # Create temporary AutoML instance with suggested hyperparameters
+        temp_automl = TextAutoML(
+            seed=self.seed,
+            approach=self.approach,
+            vocab_size=hpo_params.get('vocab_size', self.vocab_size),
+            token_length=hpo_params.get('token_length', self.token_length),
+            epochs=hpo_params.get('epochs', self.epochs),
+            batch_size=hpo_params.get('batch_size', self.batch_size),
+            lr=hpo_params.get('lr', self.lr),
+            weight_decay=hpo_params.get('weight_decay', self.weight_decay),
+            ffnn_hidden=hpo_params.get('ffnn_hidden', self.ffnn_hidden),
+            lstm_emb_dim=hpo_params.get('lstm_emb_dim', self.lstm_emb_dim),
+            lstm_hidden_dim=hpo_params.get('lstm_hidden_dim', self.lstm_hidden_dim),
+            fraction_layers_to_finetune=hpo_params.get('fraction_layers_to_finetune', self.fraction_layers_to_finetune),
+            logistic_C=hpo_params.get('logistic_C', self.logistic_C),
+            logistic_max_iter=hpo_params.get('logistic_max_iter', self.logistic_max_iter),
+        )
+        
+        # Create temporary DataFrames
+        train_df = pd.DataFrame({
+            'text': self.train_texts,
+            'label': self.train_labels
+        })
+        val_df = pd.DataFrame({
+            'text': self.val_texts,
+            'label': self.val_labels
+        })
+        
+        try:
+            # Set current trial for multi-fidelity HPO
+            temp_automl.current_trial = trial
+            
+            # Generate and apply architecture for this trial
+            temp_automl._setup_nas_model(trial, train_df, val_df)
+            
+            # Train and evaluate
+            if save_path is not None:
+                temp_automl.trial_number = trial.number
+                val_error = temp_automl.fit(train_df, val_df, self.num_classes, save_path=save_path)
+            else:
+                val_error = temp_automl.fit(train_df, val_df, self.num_classes)
+                
+            logger.info(f"NAS+HPO Trial {trial.number}: val_error = {val_error:.4f}")
+            return val_error
+            
+        except optuna.exceptions.TrialPruned:
+            # Re-raise pruned exception to be handled by Optuna
+            raise
+        except Exception as e:
+            logger.warning(f"NAS+HPO Trial {trial.number} failed: {e}")
+            return float('inf')
+
+    def fit_with_nas_hpo(
+        self,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        num_classes: int,
+        n_trials: int = 20,
+        timeout: int = 3600,
+        save_path: Path = None,
+        sampler: str = None,
+        pruner: str = None,  # For multi-fidelity HPO
+        use_multi_fidelity: bool = None,  # Enable/disable multi-fidelity
+        **kwargs
+    ):
+        """
+        Fit model with both Neural Architecture Search AND Hyperparameter Optimization.
+        
+        This method performs comprehensive optimization by searching for both optimal
+        network architectures and optimal hyperparameters simultaneously.
+        
+        Parameters:
+        - train_df, val_df: Training and validation data
+        - num_classes: Number of output classes
+        - n_trials: Number of combined NAS+HPO trials to evaluate
+        - timeout: Maximum time for combined optimization
+        - save_path: Path to save best results
+        - sampler: Optuna sampler ('tpe', 'random', 'cmaes', 'nsga2')
+        - pruner: Optuna pruner for multi-fidelity ('median', 'successive_halving', 'hyperband')
+        - use_multi_fidelity: Enable/disable multi-fidelity optimization
+        """
+        if not OPTUNA_AVAILABLE:
+            raise ImportError("Optuna is required for NAS+HPO. Install with: pip install optuna")
+            
+        if self.approach not in ['ffnn', 'lstm']:
+            raise ValueError(f"NAS is not supported for approach '{self.approach}'. Use 'ffnn' or 'lstm'.")
+            
+        # Force enable NAS for this method
+        original_use_nas = getattr(self, 'use_nas', False)
+        self.use_nas = True
+        
+        if use_multi_fidelity is not None:
+            self.use_multi_fidelity = use_multi_fidelity
+            
+        if self.use_multi_fidelity:
+            logger.info("Starting fit_with_nas_hpo with multi-fidelity optimization...")
+        else:
+            logger.info("Starting fit_with_nas_hpo with standard optimization...")
+        
+        logger.info(f"Starting combined NAS+HPO optimization for {self.approach} with {n_trials} trials...")
+        
+        # Store data for optimization
+        self.train_texts = train_df['text'].tolist()
+        self.train_labels = train_df['label'].tolist()
+        self.val_texts = val_df['text'].tolist()
+        self.val_labels = val_df['label'].tolist()
+        self.num_classes = num_classes
+        
+        # Run combined NAS+HPO optimization
+        best_score, best_params, study = self.optimize_hyperparameters(n_trials, timeout, save_path, sampler, pruner)
+        
+        # Apply best hyperparameters to current instance
+        logger.info("Applying best hyperparameters to current instance...")
+        for param, value in best_params.items():
+            if hasattr(self, param):
+                setattr(self, param, value)
+        
+        # Apply best architecture to current instance
+        logger.info("Applying best architecture to current instance...")
+        train_df_for_nas = pd.DataFrame({
+            'text': self.train_texts,
+            'label': self.train_labels
+        })
+        val_df_for_nas = pd.DataFrame({
+            'text': self.val_texts,
+            'label': self.val_labels
+        })
+        self._setup_nas_model(study.best_trial, train_df_for_nas, val_df_for_nas)
+        
+        # Final training with best architecture and hyperparameters
+        logger.info("Training final model with optimized architecture and hyperparameters...")
+        final_score = self.fit(train_df, val_df, num_classes, save_path=save_path, **kwargs)
+        
+        # Restore original NAS setting
+        self.use_nas = original_use_nas
+        
+        if self.use_multi_fidelity:
+            logger.info(f"Combined NAS+HPO with multi-fidelity completed. Final validation error: {final_score:.4f}")
+        else:
+            logger.info(f"Combined NAS+HPO completed. Final validation error: {final_score:.4f}")
+        return final_score
 
 # end of file

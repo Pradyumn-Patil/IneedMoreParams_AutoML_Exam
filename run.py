@@ -64,6 +64,9 @@ def main_loop(
         hpo_sampler: str = 'tpe',
         hpo_pruner: str = 'median',
         use_multi_fidelity: bool = False,
+        use_nas: bool = False,
+        nas_trials: int = 20,
+        nas_timeout: int = 3600,
     ) -> None:
     match dataset:
         case "ag_news":
@@ -124,7 +127,20 @@ def main_loop(
     )
 
     # Fit the AutoML model on the training and validation datasets
-    if use_hpo:
+    if use_hpo and use_nas:
+        val_err = automl.fit_with_nas_hpo(
+            train_df,
+            val_df,
+            num_classes=num_classes,
+            n_trials=max(hpo_trials, nas_trials),  # Use the larger of the two
+            timeout=max(hpo_timeout, nas_timeout),  # Use the larger of the two
+            sampler=hpo_sampler,
+            pruner=hpo_pruner,
+            use_multi_fidelity=use_multi_fidelity,
+            load_path=load_path,
+            save_path=output_path,
+        )
+    elif use_hpo:
         val_err = automl.fit_with_hpo(
             train_df,
             val_df,
@@ -132,6 +148,18 @@ def main_loop(
             n_trials=hpo_trials,
             timeout=hpo_timeout,
             sampler=hpo_sampler,
+            pruner=hpo_pruner,
+            use_multi_fidelity=use_multi_fidelity,
+            load_path=load_path,
+            save_path=output_path,
+        )
+    elif use_nas:
+        val_err = automl.fit_with_nas(
+            train_df,
+            val_df,
+            num_classes=num_classes,
+            n_trials=nas_trials,
+            timeout=nas_timeout,
             load_path=load_path,
             save_path=output_path,
         )
@@ -335,6 +363,23 @@ if __name__ == "__main__":
         action="store_true",
         help="Enable multi-fidelity optimization with pruning."
     )
+    parser.add_argument(
+        "--use-nas",
+        action="store_true",
+        help="Enable Neural Architecture Search using Optuna."
+    )
+    parser.add_argument(
+        "--nas-trials",
+        type=int,
+        default=20,
+        help="Number of trials for Neural Architecture Search."
+    )
+    parser.add_argument(
+        "--nas-timeout",
+        type=int,
+        default=3600,
+        help="Timeout in seconds for Neural Architecture Search."
+    )
 
     args = parser.parse_args()
 
@@ -378,5 +423,8 @@ if __name__ == "__main__":
         hpo_sampler=args.hpo_sampler,
         hpo_pruner=args.hpo_pruner,
         use_multi_fidelity=args.use_multi_fidelity,
+        use_nas=args.use_nas,
+        nas_trials=args.nas_trials,
+        nas_timeout=args.nas_timeout,
     )
 # end of file
