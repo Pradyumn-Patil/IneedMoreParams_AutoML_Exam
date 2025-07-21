@@ -14,6 +14,21 @@ python run.py --data-path <path-to-downloaded-data> --dataset amazon --use-hpo -
 python run.py --data-path <path-to-downloaded-data> --dataset amazon --use-hpo --hpo-trials 50 --hpo-sampler random
 python run.py --data-path <path-to-downloaded-data> --dataset amazon --use-hpo --hpo-trials 50 --hpo-sampler cmaes
 python run.py --data-path <path-to-downloaded-data> --dataset amazon --use-hpo --hpo-trials 50 --hpo-sampler nsga2
+
+# NEPS Auto-Approach Selection (Automatic Everything!)
+# NEPS will automatically select the best combination of:
+# - Model approach (logistic, ffnn, lstm, transformer)
+# - Optimization strategy (basic, hpo, nas, nas_hpo)
+# - Multi-fidelity setting (True/False)
+# - HPO sampler (tpe, random, cmaes)
+# - HPO pruner (median, successive_halving, hyperband)
+python run.py --data-path <path-to-downloaded-data> --dataset amazon --use-neps-auto-approach --neps-max-evaluations 16 --neps-timeout 7200
+
+# NEPS with more evaluations for better results
+python run.py --data-path <path-to-downloaded-data> --dataset amazon --use-neps-auto-approach --neps-max-evaluations 32 --neps-timeout 14400 --neps-searcher bayesian_optimization
+
+# NEPS quick test with fewer evaluations
+python run.py --data-path <path-to-downloaded-data> --dataset amazon --use-neps-auto-approach --neps-max-evaluations 8 --neps-timeout 3600 --neps-searcher random_search
 ```
 
 """
@@ -67,6 +82,11 @@ def main_loop(
         use_nas: bool = False,
         nas_trials: int = 20,
         nas_timeout: int = 3600,
+        # NEPS Auto-Approach Selection
+        use_neps_auto_approach: bool = False,
+        neps_max_evaluations: int = 16,
+        neps_timeout: int = 7200,
+        neps_searcher: str = 'bayesian_optimization',
     ) -> None:
     match dataset:
         case "ag_news":
@@ -126,8 +146,28 @@ def main_loop(
         use_multi_fidelity=use_multi_fidelity,
     )
 
-    # Fit the AutoML model on the training and validation datasets
-    if use_hpo and use_nas:
+    # Check if NEPS auto-approach selection should be used
+    if use_neps_auto_approach:
+        logger.info("Using NEPS automatic approach selection")
+        logger.info("NEPS will select the best approach and optimization strategy automatically")
+        logger.info("Existing Optuna methods will be used internally for optimization")
+        
+        val_err = automl.fit_with_neps_auto_approach(
+            train_df=train_df,
+            val_df=val_df,
+            num_classes=num_classes,
+            max_evaluations=neps_max_evaluations,
+            timeout=neps_timeout,
+            searcher=neps_searcher,
+            working_directory=str(output_path / "neps_auto_approach"),
+            save_path=output_path,
+        )
+        
+        logger.info(f"NEPS auto-approach selection completed!")
+        logger.info(f"Final validation error: {val_err:.4f}")
+        
+    # Standard Optuna-based pipeline with manual approach selection
+    elif use_hpo and use_nas:
         val_err = automl.fit_with_nas_hpo(
             train_df,
             val_df,
@@ -380,6 +420,32 @@ if __name__ == "__main__":
         default=3600,
         help="Timeout in seconds for Neural Architecture Search."
     )
+    
+    # NEPS Auto-Approach Selection arguments
+    parser.add_argument(
+        "--use-neps-auto-approach",
+        action="store_true",
+        help="Use NEPS for automatic approach selection (uses existing Optuna methods internally)."
+    )
+    parser.add_argument(
+        "--neps-max-evaluations",
+        type=int,
+        default=16,
+        help="Maximum number of approach+strategy combinations for NEPS to evaluate."
+    )
+    parser.add_argument(
+        "--neps-timeout",
+        type=int,
+        default=7200,
+        help="Total timeout in seconds for NEPS auto-approach selection."
+    )
+    parser.add_argument(
+        "--neps-searcher",
+        type=str,
+        default="bayesian_optimization",
+        choices=["bayesian_optimization", "evolutionary_search", "random_search"],
+        help="NEPS searcher algorithm for approach selection."
+    )
 
     args = parser.parse_args()
 
@@ -426,5 +492,10 @@ if __name__ == "__main__":
         use_nas=args.use_nas,
         nas_trials=args.nas_trials,
         nas_timeout=args.nas_timeout,
+        # NEPS Auto-Approach Selection
+        use_neps_auto_approach=args.use_neps_auto_approach,
+        neps_max_evaluations=args.neps_max_evaluations,
+        neps_timeout=args.neps_timeout,
+        neps_searcher=args.neps_searcher,
     )
 # end of file

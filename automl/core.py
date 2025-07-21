@@ -11,8 +11,10 @@ from automl.models import SimpleFFNN, LSTMClassifier, NASSearchableFFNN, NASSear
 from automl.utils import SimpleTextDataset
 from pathlib import Path
 import logging
+import time
 from typing import Tuple
 from collections import Counter
+import yaml
 
 try:
     import optuna
@@ -27,6 +29,12 @@ try:
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
+
+try:
+    import neps
+    NEPS_AVAILABLE = True
+except ImportError:
+    NEPS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -1097,5 +1105,361 @@ class TextAutoML:
         else:
             logger.info(f"Combined NAS+HPO completed. Final validation error: {final_score:.4f}")
         return final_score
+
+    # ========== NEPS Auto-Approach Selection Pipeline ==========
+    
+    def _create_neps_approach_search_space(self):
+        """Create NEPS search space for approach selection."""
+        if not NEPS_AVAILABLE:
+            raise ImportError("NEPS is required. Install with: pip install neps")
+            
+        search_space = {
+            'approach': neps.CategoricalParameter(choices=['logistic', 'ffnn', 'lstm', 'transformer']),
+            'optimization_strategy': neps.CategoricalParameter(choices=['basic', 'hpo', 'nas', 'nas_hpo']),
+            'use_multi_fidelity': neps.CategoricalParameter(choices=[True, False]),
+            'hpo_sampler': neps.CategoricalParameter(choices=['tpe', 'random', 'cmaes']),
+            'hpo_pruner': neps.CategoricalParameter(choices=['median', 'successive_halving', 'hyperband']),
+        }
+        
+        logger.info("Created NEPS approach selection search space with multi-fidelity options")
+        return search_space
+
+    def _neps_approach_objective(self, approach: str, optimization_strategy: str, use_multi_fidelity: bool, hpo_sampler: str, hpo_pruner: str):
+        """NEPS objective function that uses existing Optuna-based methods."""
+        try:
+            start_time = time.time()
+            
+            logger.info(f"NEPS trying approach='{approach}' with strategy='{optimization_strategy}', "
+                       f"multi_fidelity={use_multi_fidelity}, sampler={hpo_sampler}, pruner={hpo_pruner}")
+            
+            # Create temporary AutoML instance with the suggested approach and settings
+            temp_automl = TextAutoML(
+                seed=self.seed,
+                approach=approach,
+                vocab_size=self.vocab_size,
+                token_length=self.token_length,
+                epochs=self.epochs,
+                batch_size=self.batch_size,
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+                ffnn_hidden=self.ffnn_hidden,
+                lstm_emb_dim=self.lstm_emb_dim,
+                lstm_hidden_dim=self.lstm_hidden_dim,
+                fraction_layers_to_finetune=self.fraction_layers_to_finetune,
+                logistic_C=self.logistic_C,
+                logistic_max_iter=self.logistic_max_iter,
+                hpo_sampler=hpo_sampler,
+                hpo_pruner=hpo_pruner,
+                use_multi_fidelity=use_multi_fidelity,
+            )
+            
+            # Create DataFrames for training
+            train_df = pd.DataFrame({
+                'text': self.train_texts,
+                'label': self.train_labels
+            })
+            val_df = pd.DataFrame({
+                'text': self.val_texts,
+                'label': self.val_labels
+            })
+            
+            # Use existing Optuna-based methods based on optimization strategy
+            if optimization_strategy == 'basic':
+                # Just basic training
+                val_error = temp_automl.fit(train_df, val_df, self.num_classes)
+                
+            elif optimization_strategy == 'hpo':
+                # Use existing HPO method
+                val_error = temp_automl.fit_with_hpo(
+                    train_df, val_df, self.num_classes,
+                    n_trials=10,  # Reduced for NEPS efficiency
+                    timeout=600,  # 10 minutes per approach
+                    sampler=hpo_sampler,
+                    pruner=hpo_pruner,
+                    use_multi_fidelity=use_multi_fidelity,
+                )
+                
+            elif optimization_strategy == 'nas':
+                # Use existing NAS method (only for supported approaches)
+                if approach in ['ffnn', 'lstm']:
+                    val_error = temp_automl.fit_with_nas(
+                        train_df, val_df, self.num_classes,
+                        n_trials=8,   # Reduced for NEPS efficiency
+                        timeout=600,  # 10 minutes per approach
+                    )
+                else:
+                    # Fallback to HPO for non-NAS approaches
+                    logger.info(f"NAS not supported for {approach}, falling back to HPO")
+                    val_error = temp_automl.fit_with_hpo(
+                        train_df, val_df, self.num_classes,
+                        n_trials=10,
+                        timeout=600,
+                        sampler=hpo_sampler,
+                        pruner=hpo_pruner,
+                        use_multi_fidelity=use_multi_fidelity,
+                    )
+                    
+            elif optimization_strategy == 'nas_hpo':
+                # Use existing combined NAS+HPO method
+                if approach in ['ffnn', 'lstm']:
+                    val_error = temp_automl.fit_with_nas_hpo(
+                        train_df, val_df, self.num_classes,
+                        n_trials=12,  # Reduced for NEPS efficiency
+                        timeout=800,  # A bit more time for combined optimization
+                        sampler=hpo_sampler,
+                        pruner=hpo_pruner,
+                        use_multi_fidelity=use_multi_fidelity,
+                    )
+                else:
+                    # Fallback to HPO for non-NAS approaches
+                    logger.info(f"NAS not supported for {approach}, falling back to HPO")
+                    val_error = temp_automl.fit_with_hpo(
+                        train_df, val_df, self.num_classes,
+                        n_trials=10,
+                        timeout=600,
+                        sampler=hpo_sampler,
+                        pruner=hpo_pruner,
+                        use_multi_fidelity=use_multi_fidelity,
+                    )
+            else:
+                raise ValueError(f"Unknown optimization strategy: {optimization_strategy}")
+            
+            training_time = time.time() - start_time
+            
+            logger.info(f"NEPS approach trial completed: approach={approach}, strategy={optimization_strategy}, "
+                       f"multi_fidelity={use_multi_fidelity}, sampler={hpo_sampler}, pruner={hpo_pruner}, "
+                       f"val_error={val_error:.4f}, time={training_time:.2f}s")
+            
+            return {
+                'loss': val_error,
+                'cost': training_time,
+                'approach': approach,
+                'strategy': optimization_strategy,
+                'use_multi_fidelity': use_multi_fidelity,
+                'hpo_sampler': hpo_sampler,
+                'hpo_pruner': hpo_pruner,
+            }
+            
+        except Exception as e:
+            training_time = time.time() - start_time if 'start_time' in locals() else 0.0
+            logger.error(f"NEPS approach trial failed: approach={approach}, strategy={optimization_strategy}, "
+                        f"multi_fidelity={use_multi_fidelity}, sampler={hpo_sampler}, pruner={hpo_pruner}, error={e}")
+            return {
+                'loss': float('inf'),
+                'cost': training_time,
+                'approach': approach,
+                'strategy': optimization_strategy,
+                'use_multi_fidelity': use_multi_fidelity,
+                'hpo_sampler': hpo_sampler,
+                'hpo_pruner': hpo_pruner,
+            }
+
+    def fit_with_neps_auto_approach(
+        self,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        num_classes: int,
+        max_evaluations: int = 16,  # 4 approaches × 4 strategies = 16 combinations
+        timeout: int = 7200,  # 2 hours total
+        searcher: str = 'bayesian_optimization',
+        working_directory: str = "./neps_auto_approach",
+        save_path: Path = None,
+        **kwargs
+    ):
+        """
+        NEPS-based automatic approach selection that uses existing Optuna methods.
+        
+        This method uses NEPS at the top level to select the best approach and optimization strategy,
+        while leveraging all the existing Optuna-based optimization methods internally.
+        
+        Parameters:
+        - train_df, val_df: Training and validation data
+        - num_classes: Number of output classes
+        - max_evaluations: Maximum number of approach+strategy combinations to try
+        - timeout: Total timeout in seconds
+        - searcher: NEPS searcher algorithm
+        - working_directory: NEPS working directory
+        - save_path: Path to save final model
+        """
+        if not NEPS_AVAILABLE:
+            raise ImportError("NEPS is required for auto-approach selection. Install with: pip install neps")
+            
+        logger.info("Starting NEPS automatic approach selection...")
+        logger.info("This will use existing Optuna methods (fit_with_hpo, fit_with_nas, fit_with_nas_hpo) internally")
+        logger.info(f"Max evaluations: {max_evaluations}, Total timeout: {timeout}s")
+        
+        # Store data for optimization
+        self.train_texts = train_df['text'].tolist()
+        self.train_labels = train_df['label'].tolist()
+        self.val_texts = val_df['text'].tolist()
+        self.val_labels = val_df['label'].tolist()
+        self.num_classes = num_classes
+        
+        # Create search space for approach selection
+        search_space = self._create_neps_approach_search_space()
+        
+        # Setup working directory
+        working_dir = Path(working_directory)
+        working_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Configure NEPS run
+        neps_config = {
+            'pipeline_space': search_space,
+            'working_directory': str(working_dir),
+            'max_evaluations_total': max_evaluations,
+            'searcher': searcher,
+        }
+        
+        if timeout > 0:
+            neps_config['max_cost_total'] = timeout
+            
+        logger.info(f"NEPS configuration: {neps_config}")
+        
+        # Run NEPS optimization
+        neps.run(
+            run_pipeline=self._neps_approach_objective,
+            **neps_config
+        )
+        
+        # Get best result
+        try:
+            best_result = neps.status(working_dir)
+            best_config = best_result.best_config
+            best_score = best_result.best_loss
+            
+            logger.info(f"NEPS auto-approach selection completed!")
+            logger.info(f"Best approach: {best_config.get('approach', 'unknown')}")
+            logger.info(f"Best optimization strategy: {best_config.get('optimization_strategy', 'unknown')}")
+            logger.info(f"Best multi-fidelity setting: {best_config.get('use_multi_fidelity', 'unknown')}")
+            logger.info(f"Best HPO sampler: {best_config.get('hpo_sampler', 'unknown')}")
+            logger.info(f"Best HPO pruner: {best_config.get('hpo_pruner', 'unknown')}")
+            logger.info(f"Best validation error: {best_score:.4f}")
+            
+        except Exception as e:
+            logger.warning(f"Could not retrieve NEPS results: {e}")
+            best_config = {
+                'approach': 'ffnn', 
+                'optimization_strategy': 'hpo',
+                'use_multi_fidelity': True,
+                'hpo_sampler': 'tpe',
+                'hpo_pruner': 'median'
+            }  # Safe fallback
+            best_score = float('inf')
+        
+        # Train final model with best approach and strategy
+        if best_config and best_score < float('inf'):
+            logger.info("Training final model with best approach and optimization strategy...")
+            
+            best_approach = best_config.get('approach', 'ffnn')
+            best_strategy = best_config.get('optimization_strategy', 'hpo')
+            best_multi_fidelity = best_config.get('use_multi_fidelity', True)
+            best_sampler = best_config.get('hpo_sampler', 'tpe')
+            best_pruner = best_config.get('hpo_pruner', 'median')
+            
+            # Update current instance with best approach and settings
+            self.approach = best_approach
+            self.use_multi_fidelity = best_multi_fidelity
+            self.hpo_sampler = best_sampler
+            self.hpo_pruner = best_pruner
+            
+            # Train final model using the best strategy with existing methods
+            if best_strategy == 'basic':
+                final_score = self.fit(train_df, val_df, num_classes, save_path=save_path, **kwargs)
+                
+            elif best_strategy == 'hpo':
+                final_score = self.fit_with_hpo(
+                    train_df, val_df, num_classes,
+                    n_trials=20,  # Full trials for final model
+                    timeout=1800,  # 30 minutes for final optimization
+                    sampler=best_sampler,
+                    pruner=best_pruner,
+                    use_multi_fidelity=best_multi_fidelity,
+                    save_path=save_path,
+                    **kwargs
+                )
+                
+            elif best_strategy == 'nas':
+                if best_approach in ['ffnn', 'lstm']:
+                    final_score = self.fit_with_nas(
+                        train_df, val_df, num_classes,
+                        n_trials=15,
+                        timeout=1800,
+                        save_path=save_path,
+                        **kwargs
+                    )
+                else:
+                    logger.info(f"NAS not supported for {best_approach}, using HPO for final model")
+                    final_score = self.fit_with_hpo(
+                        train_df, val_df, num_classes,
+                        n_trials=20,
+                        timeout=1800,
+                        sampler=best_sampler,
+                        pruner=best_pruner,
+                        use_multi_fidelity=best_multi_fidelity,
+                        save_path=save_path,
+                        **kwargs
+                    )
+                    
+            elif best_strategy == 'nas_hpo':
+                if best_approach in ['ffnn', 'lstm']:
+                    final_score = self.fit_with_nas_hpo(
+                        train_df, val_df, num_classes,
+                        n_trials=25,
+                        timeout=2400,  # 40 minutes for combined optimization
+                        sampler=best_sampler,
+                        pruner=best_pruner,
+                        use_multi_fidelity=best_multi_fidelity,
+                        save_path=save_path,
+                        **kwargs
+                    )
+                else:
+                    logger.info(f"NAS not supported for {best_approach}, using HPO for final model")
+                    final_score = self.fit_with_hpo(
+                        train_df, val_df, num_classes,
+                        n_trials=20,
+                        timeout=1800,
+                        sampler=best_sampler,
+                        pruner=best_pruner,
+                        use_multi_fidelity=best_multi_fidelity,
+                        save_path=save_path,
+                        **kwargs
+                    )
+            else:
+                raise ValueError(f"Unknown optimization strategy: {best_strategy}")
+            
+            logger.info(f"NEPS auto-approach pipeline completed!")
+            logger.info(f"Final approach: {best_approach}")
+            logger.info(f"Final strategy: {best_strategy}")
+            logger.info(f"Final multi-fidelity: {best_multi_fidelity}")
+            logger.info(f"Final sampler: {best_sampler}")
+            logger.info(f"Final pruner: {best_pruner}")
+            logger.info(f"Final validation error: {final_score:.4f}")
+            
+            # Save results summary
+            if save_path is not None:
+                results_summary = {
+                    'neps_auto_approach': True,
+                    'best_approach': best_approach,
+                    'best_optimization_strategy': best_strategy,
+                    'best_use_multi_fidelity': best_multi_fidelity,
+                    'best_hpo_sampler': best_sampler,
+                    'best_hpo_pruner': best_pruner,
+                    'neps_best_validation_error': float(best_score),
+                    'final_validation_error': float(final_score),
+                    'max_evaluations': max_evaluations,
+                    'total_timeout': timeout,
+                    'searcher': searcher,
+                    'seed': self.seed,
+                }
+                
+                with open(save_path / "neps_auto_approach_summary.yaml", 'w') as f:
+                    yaml.dump(results_summary, f, default_flow_style=False)
+                
+                logger.info(f"Results summary saved to {save_path / 'neps_auto_approach_summary.yaml'}")
+            
+            return final_score
+        else:
+            logger.error("NEPS auto-approach selection failed")
+            return float('inf')
 
 # end of file
