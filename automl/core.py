@@ -1117,7 +1117,7 @@ class TextAutoML:
             'approach': neps.CategoricalParameter(choices=['logistic', 'ffnn', 'lstm', 'transformer']),
             'optimization_strategy': neps.CategoricalParameter(choices=['basic', 'hpo', 'nas', 'nas_hpo']),
             'use_multi_fidelity': neps.CategoricalParameter(choices=[True, False]),
-            'hpo_sampler': neps.CategoricalParameter(choices=['tpe', 'random', 'cmaes']),
+            'hpo_sampler': neps.CategoricalParameter(choices=['tpe', 'random', 'cmaes', 'nsga2']),
             'hpo_pruner': neps.CategoricalParameter(choices=['median', 'successive_halving', 'hyperband']),
         }
         
