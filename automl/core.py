@@ -52,6 +52,8 @@ class TextAutoML:
         hpo_sampler='tpe',  # 'tpe', 'random', 'cmaes', 'nsga2'
         hpo_pruner='median',  # 'median', 'successive_halving', 'hyperband'
         use_multi_fidelity=True,  # Enable/disable multi-fidelity optimization
+        # NAS parameters
+        use_nas=False,  # Enable/disable neural architecture search
     ):
         self.seed = seed
         np.random.seed(seed)
@@ -831,6 +833,9 @@ class TextAutoML:
         )
         
         try:
+            # Set num_classes before setting up NAS model
+            temp_automl.num_classes = self.num_classes
+            
             # Generate architecture for this trial
             temp_automl._setup_nas_model(trial, train_df, val_df)
             
@@ -914,6 +919,10 @@ class TextAutoML:
     
     def _setup_nas_model(self, trial, train_df, val_df):
         """Setup NAS model based on trial architecture configuration."""
+        # Validate num_classes
+        if self.num_classes is None:
+            raise ValueError("num_classes must be set before calling _setup_nas_model")
+            
         if self.approach == 'ffnn':
             # Setup data processing for FFNN
             self.vectorizer = TfidfVectorizer(
@@ -942,7 +951,11 @@ class TextAutoML:
             vocab_size = len(self.tokenizer)
             
             # Generate architecture
-            architecture_config = NASSearchSpace.generate_lstm_architecture(trial, vocab_size, self.num_classes)
+            architecture_config = NASSearchSpace.generate_lstm_architecture(
+                trial=trial,
+                vocab_size=vocab_size,
+                output_dim=self.num_classes
+            )
             logger.info(f"NAS LSTM Architecture: {architecture_config}")
             
             # Create model
@@ -987,6 +1000,9 @@ class TextAutoML:
         try:
             # Set current trial for multi-fidelity HPO
             temp_automl.current_trial = trial
+            
+            # Set num_classes before setting up NAS model
+            temp_automl.num_classes = self.num_classes
             
             # Generate and apply architecture for this trial
             temp_automl._setup_nas_model(trial, train_df, val_df)

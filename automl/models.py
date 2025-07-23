@@ -58,15 +58,24 @@ class NASSearchSpace:
     @staticmethod
     def generate_lstm_architecture(trial, vocab_size, output_dim):
         """Generate LSTM architecture configuration using Optuna trial."""
+        # Validate output_dim
+        if output_dim is None:
+            raise ValueError("output_dim cannot be None for LSTM architecture generation")
+            
+        use_attention = trial.suggest_categorical('use_attention', [True, False])
+        embedding_dim = trial.suggest_int('embedding_dim', 64, 256)
+        if use_attention:
+            embedding_dim = (embedding_dim // 8) * 8
+
         config = {
             'vocab_size': vocab_size,
             'output_dim': output_dim,
-            'embedding_dim': trial.suggest_int('embedding_dim', 64, 256),
+            'embedding_dim': embedding_dim,
             'hidden_dim': trial.suggest_int('hidden_dim', 64, 256),
             'num_layers': trial.suggest_int('num_layers', 1, 3),
             'dropout': trial.suggest_float('dropout', 0.0, 0.5),
             'bidirectional': trial.suggest_categorical('bidirectional', [True, False]),
-            'use_attention': trial.suggest_categorical('use_attention', [True, False])
+            'use_attention': use_attention
         }
         
         return config
@@ -125,6 +134,10 @@ class NASSearchableLSTM(nn.Module):
     def __init__(self, vocab_size, output_dim, architecture_config):
         super().__init__()
         self.config = architecture_config
+        
+        # Validate output_dim
+        if output_dim is None:
+            raise ValueError("output_dim cannot be None for NASSearchableLSTM")
         
         # Embedding layer
         self.embed = nn.Embedding(
