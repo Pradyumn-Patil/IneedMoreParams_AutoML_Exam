@@ -63,18 +63,42 @@ class NASSearchSpace:
             raise ValueError("output_dim cannot be None for LSTM architecture generation")
             
         use_attention = trial.suggest_categorical('use_attention', [True, False])
+        bidirectional = trial.suggest_categorical('bidirectional', [True, False])
+        
+        # Generate dimensions
         embedding_dim = trial.suggest_int('embedding_dim', 64, 256)
+        hidden_dim = trial.suggest_int('hidden_dim', 64, 256)
+        
+        # If using attention, ensure the final LSTM output dimension is divisible by common head counts
         if use_attention:
-            embedding_dim = (embedding_dim // 8) * 8
+            lstm_output_dim = hidden_dim * (2 if bidirectional else 1)
+            
+            # Find the largest divisor that's also a reasonable number of heads
+            possible_heads = [1, 2, 4, 8, 16]
+            best_heads = 1
+            for heads in possible_heads:
+                if lstm_output_dim % heads == 0:
+                    best_heads = heads
+            
+            # If lstm_output_dim is not divisible by any good number of heads,
+            # adjust it to be divisible by the largest possible number
+            if best_heads == 1 and lstm_output_dim > 8:
+                # Round down to nearest multiple of 8
+                lstm_output_dim = (lstm_output_dim // 8) * 8
+                # Update hidden_dim accordingly
+                hidden_dim = lstm_output_dim // (2 if bidirectional else 1)
+            
+            # Ensure embedding_dim is also reasonable for attention
+            embedding_dim = max(32, ((embedding_dim + 7) // 8) * 8)
 
         config = {
             'vocab_size': vocab_size,
             'output_dim': output_dim,
             'embedding_dim': embedding_dim,
-            'hidden_dim': trial.suggest_int('hidden_dim', 64, 256),
+            'hidden_dim': hidden_dim,
             'num_layers': trial.suggest_int('num_layers', 1, 3),
             'dropout': trial.suggest_float('dropout', 0.0, 0.5),
-            'bidirectional': trial.suggest_categorical('bidirectional', [True, False]),
+            'bidirectional': bidirectional,
             'use_attention': use_attention
         }
         
@@ -164,11 +188,34 @@ class NASSearchableLSTM(nn.Module):
         # Attention mechanism (optional)
         self.use_attention = architecture_config['use_attention']
         if self.use_attention:
-            self.attention = nn.MultiheadAttention(
-                lstm_output_dim, 
-                num_heads=4, 
-                batch_first=True
-            )
+            # Calculate appropriate number of heads that divides lstm_output_dim
+            # Start from the largest possible number of heads and work down
+            possible_heads = [16, 8, 4, 2, 1]
+            num_heads = 1
+            for heads in possible_heads:
+                if lstm_output_dim % heads == 0 and heads <= lstm_output_dim // 4:
+                    num_heads = heads
+                    break
+            
+            # Final safety check and adjustment
+            if lstm_output_dim % num_heads != 0:
+                # Force to use 1 head if nothing else works
+                num_heads = 1
+            
+            # If lstm_output_dim is too small for multiple heads, use 1 head
+            if lstm_output_dim < 8:
+                num_heads = 1
+            
+            try:
+                self.attention = nn.MultiheadAttention(
+                    lstm_output_dim, 
+                    num_heads=num_heads, 
+                    batch_first=True
+                )
+            except Exception as e:
+                # If attention still fails, disable it and add a warning
+                print(f"Warning: Failed to create attention with lstm_output_dim={lstm_output_dim}, num_heads={num_heads}. Disabling attention. Error: {e}")
+                self.use_attention = False
         
         # Output layer
         self.fc = nn.Linear(lstm_output_dim, output_dim)
