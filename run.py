@@ -48,6 +48,8 @@ from automl.datasets import (
     DBpediaDataset,
     IMDBDataset,
 )
+from automl.core import train, evaluate, save_checkpoint, load_checkpoint
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -276,6 +278,12 @@ if __name__ == "__main__":
         help="The path to resume checkpoint from."
     )
     parser.add_argument(
+        "--load-epoch",
+        type=int,
+        default=None,
+        help="If provided, resume training from specific checkpoint_epoch{N}.pth"
+    )
+    parser.add_argument(
         "--data-path",
         type=Path,
         default=None,
@@ -464,7 +472,14 @@ if __name__ == "__main__":
     args.output_path = Path(args.output_path).absolute()
     args.output_path.mkdir(parents=True, exist_ok=True)
 
-    logging.basicConfig(level=logging.INFO, filename=args.output_path / "run.log")
+    logging.basicConfig(
+    level=logging.INFO,
+    format='[%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(args.output_path / "run.log"),
+        logging.StreamHandler()
+        ]
+    )
 
     main_loop(
         dataset=args.dataset,
@@ -497,5 +512,6 @@ if __name__ == "__main__":
         neps_max_evaluations=args.neps_max_evaluations,
         neps_timeout=args.neps_timeout,
         neps_searcher=args.neps_searcher,
+        load_epoch=args.load_epoch,
     )
 # end of file

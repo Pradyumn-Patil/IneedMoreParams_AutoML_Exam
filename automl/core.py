@@ -15,6 +15,7 @@ import time
 from typing import Tuple
 from collections import Counter
 import yaml
+import os
 
 try:
     import optuna
@@ -280,47 +281,56 @@ class TextAutoML:
         val_loader: DataLoader,
         load_path: Path=None,
         save_path: Path=None,
-        trial=None,  # For multi-fidelity HPO
+        trial=None,
+        load_epoch: int=None,
     ):
+        self._nas_mode = getattr(self, "_nas_mode", False)  # ⬅️ Ensure attribute exists
+
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
         criterion = nn.CrossEntropyLoss()
 
         start_epoch = 0
-        # handling checkpoint resume
         if load_path is not None:
-            # Try to find checkpoint file
-            checkpoint_files = list(Path(load_path).glob("checkpoint*.pth"))
-            if checkpoint_files:
-                # Prioritize checkpoint selection
-                checkpoint_file = None
-                
-                # First, check if there's a generic checkpoint.pth (for non-HPO usage)
-                generic_checkpoint = Path(load_path) / "checkpoint.pth"
-                if generic_checkpoint.exists():
-                    checkpoint_file = generic_checkpoint
-                    logger.info("Found generic checkpoint.pth, using for resume")
+            checkpoint_file = None
+
+            if load_epoch is not None:
+                candidate = Path(load_path) / f"checkpoint_epoch{load_epoch}.pth"
+                if candidate.exists():
+                    checkpoint_file = candidate
+                    logger.info(f"[Warm Start] Loading checkpoint_epoch{load_epoch}.pth")
                 else:
-                    # No generic checkpoint, look for trial-specific ones (HPO usage)
-                    trial_files = [f for f in checkpoint_files if "trial_" in f.name]
-                    if trial_files:
-                        # Files are zero-padded, so alphabetical sort = numerical sort
-                        trial_files.sort()
-                        checkpoint_file = trial_files[-1]  # Use the latest trial
-                        logger.info(f"Found trial checkpoints, using latest: {checkpoint_file.name}")
+                    logger.warning(f"checkpoint_epoch{load_epoch}.pth not found in {load_path}")
+
+            if checkpoint_file is None:
+                checkpoint_files = list(Path(load_path).glob("checkpoint*.pth"))
+                if checkpoint_files:
+                    generic_checkpoint = Path(load_path) / "checkpoint.pth"
+                    if generic_checkpoint.exists():
+                        checkpoint_file = generic_checkpoint
+                        logger.info("Found generic checkpoint.pth, using for resume")
                     else:
-                        # Fallback to any checkpoint file
-                        checkpoint_files.sort()
-                        checkpoint_file = checkpoint_files[-1]
-                        logger.info(f"Using fallback checkpoint: {checkpoint_file.name}")
-                
+                        trial_files = [f for f in checkpoint_files if "trial_" in f.name]
+                        if trial_files:
+                            trial_files.sort()
+                            checkpoint_file = trial_files[-1]
+                            logger.info(f"Found trial checkpoints, using latest: {checkpoint_file.name}")
+                        else:
+                            checkpoint_files.sort()
+                            checkpoint_file = checkpoint_files[-1]
+                            logger.info(f"Using fallback checkpoint: {checkpoint_file.name}")
+
+            if checkpoint_file is not None:
                 logger.info(f"Loading checkpoint from: {checkpoint_file}")
                 _states = torch.load(checkpoint_file, map_location='cpu')
                 self.model.load_state_dict(_states["model_state_dict"])
                 optimizer.load_state_dict(_states["optimizer_state_dict"])
-                start_epoch = _states["epoch"]
+                start_epoch = _states["epoch"] + 1
                 logger.info(f"Resuming from checkpoint at epoch {start_epoch}")
             else:
                 logger.warning(f"No checkpoint files found in {load_path}")
+
+        best_val_acc = 0.0
+        best_checkpoint = None  # ⬅️ Store best model weights
 
         for epoch in range(start_epoch, self.epochs):            
             total_loss = 0
@@ -328,7 +338,6 @@ class TextAutoML:
                 self.model.train()
                 optimizer.zero_grad()
 
-                # if isinstance(batch, dict):
                 if isinstance(self.model, AutoModelForSequenceClassification):
                     inputs = {k: v.to(self.device) for k, v in batch.items()}
                     outputs = self.model(**inputs)
@@ -349,66 +358,62 @@ class TextAutoML:
 
                     outputs = outputs.logits if self.approach == "transformer" else outputs
                     loss = criterion(outputs, labels)
+
                 loss.backward()
                 optimizer.step()
                 total_loss += loss.item()
 
             logger.info(f"Epoch {epoch + 1}, Loss: {total_loss:.4f}")
 
-            # Multi-fidelity HPO: report intermediate values and check for pruning
-            if trial is not None and self.val_texts and self.use_multi_fidelity:
-                val_preds, val_labels = self._predict(val_loader)
-                val_acc = accuracy_score(val_labels, val_preds)
-                val_error = 1 - val_acc
-                
-                # Report intermediate value to Optuna for pruning
-                trial.report(val_error, epoch)
-                    
-                # Check if trial should be pruned
-                if trial.should_prune():
-                    # Get study to compare with other trials
-                    study = trial.study
-                    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-                    
-                    # Concise pruning log
-                    best_error = min(t.value for t in completed_trials) if completed_trials else "N/A"
-                    logger.info(f"Trial #{trial.number} PRUNED at epoch {epoch + 1} | "
-                              f"Error: {val_error:.4f} | Pruner: {self.hpo_pruner} | "
-                              f"Best so far: {best_error if best_error == 'N/A' else f'{best_error:.4f}'}")
-                    
-                    raise optuna.exceptions.TrialPruned()
-                
-                logger.info(f"Trial {trial.number} continues - performance is promising")
-            elif self.val_texts:
+            val_acc = 0.0
+            if self.val_texts:
                 val_preds, val_labels = self._predict(val_loader)
                 val_acc = accuracy_score(val_labels, val_preds)
                 logger.info(f"Epoch {epoch + 1}, Validation Accuracy: {val_acc:.4f}")
 
-        if self.val_texts:
-            val_preds, val_labels = self._predict(val_loader)
-            val_acc = accuracy_score(val_labels, val_preds)
-            logger.info(f"Epoch {epoch + 1}, Validation Accuracy: {val_acc:.4f}")
+            if trial is not None and self.val_texts and self.use_multi_fidelity:
+                val_error = 1 - val_acc
+                trial.report(val_error, epoch)
+                if trial.should_prune():
+                    study = trial.study
+                    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+                    best_error = min(t.value for t in completed_trials) if completed_trials else "N/A"
+                    logger.info(f"Trial #{trial.number} PRUNED at epoch {epoch + 1} | "
+                                f"Error: {val_error:.4f} | Pruner: {self.hpo_pruner} | "
+                                f"Best so far: {best_error if best_error == 'N/A' else f'{best_error:.4f}'}")
+                    raise optuna.exceptions.TrialPruned()
+                logger.info(f"Trial {trial.number} continues - performance is promising")
 
-        if save_path is not None:
-            save_path = Path(save_path) if not isinstance(save_path, Path) else save_path
-            save_path.mkdir(parents=True, exist_ok=True)
+            if save_path is not None:
+                save_path = Path(save_path) if not isinstance(save_path, Path) else save_path
+                save_path.mkdir(parents=True, exist_ok=True)
 
-            # Use trial-specific checkpoint name if this is during HPO
-            if hasattr(self, 'trial_number'):
-                checkpoint_name = f"checkpoint_trial_{self.trial_number:02d}.pth"  # Zero-padded 2 digits
-            else:
-                checkpoint_name = "checkpoint.pth"
-
-            torch.save(
-                {
+                checkpoint = {
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "epoch": epoch,
-                },
-                save_path / checkpoint_name
-            )   
+                }
+
+                if hasattr(self, 'trial_number'):
+                    checkpoint_name = f"checkpoint_trial_{self.trial_number:02d}.pth"
+                else:
+                    checkpoint_name = f"checkpoint_epoch{epoch}.pth"
+
+                torch.save(checkpoint, save_path / checkpoint_name)
+
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    best_checkpoint = checkpoint.copy()
+                    torch.save(checkpoint, save_path / "best.pth")
+                    logger.info(f"Saved new best model at epoch {epoch} with acc {val_acc:.4f}")
+
+        if self._nas_mode and best_checkpoint:
+            torch.save(best_checkpoint, Path(save_path) / "best_nas.pth")
+            logger.info("[NAS] Saved best model from NAS search as best_nas.pth")
+
         torch.cuda.empty_cache()
         return val_acc or 0.0
+
 
     def _predict(self, val_loader: DataLoader):
         self.model.eval()
@@ -776,6 +781,8 @@ class TextAutoML:
         """
         logger.info("Starting fit_with_nas with architecture search...")
         
+        self._nas_mode = True
+        
         # Ensure HPO is disabled for NAS-only optimization
         original_use_hpo = getattr(self, 'use_hpo', False)
         self.use_hpo = False
@@ -1064,6 +1071,8 @@ class TextAutoML:
             logger.info("Starting fit_with_nas_hpo with standard optimization...")
         
         logger.info(f"Starting combined NAS+HPO optimization for {self.approach} with {n_trials} trials...")
+        
+        self._nas_mode = True  # trigger warm-start saving
         
         # Store data for optimization
         self.train_texts = train_df['text'].tolist()
@@ -1461,5 +1470,25 @@ class TextAutoML:
         else:
             logger.error("NEPS auto-approach selection failed")
             return float('inf')
+        
+    def save_checkpoint(model, optimizer, epoch, path):
+        checkpoint = {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "epoch": epoch
+        }
+        torch.save(checkpoint, path)
+        print(f"[INFO] Checkpoint saved to {path}")
+
+
+    def load_checkpoint(model, optimizer, path):
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"No checkpoint found at {path}")
+        checkpoint = torch.load(path)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = checkpoint["epoch"] + 1  # resume from next epoch
+        print(f"[INFO] Loaded checkpoint from {path}, resuming from epoch {start_epoch}")
+        return model, optimizer, start_epoch
 
 # end of file
