@@ -81,3 +81,19 @@ experiment_results.yaml
 
 # Claude-specific
 .claude/
+
+# Extended system caches
+.cache/
+embeddings_cache/
+transformer_cache/
+meta_learning_history/
+augmentation_cache/
+
+# Extended results
+results/extended/
+results/automl_complete/
+transformer_output/
+
+# Model files from extended system
+*.safetensors
+saved_models/

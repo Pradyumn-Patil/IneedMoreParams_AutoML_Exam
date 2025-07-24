@@ -1,26 +1,61 @@
-# AutoML Text Classification Requirements
-# Generated from pyproject.toml
+# AutoML Text Classification Requirements - Extended Version
 
-# Core dependencies
-numpy>=1.0,<2.0
-scikit-learn>=1.3
-transformers>=4.20
-torch>=1.9.0  # Required by transformers
-datasets>=2.0
-optuna>=3.0
+# Core ML/DL frameworks
+numpy>=1.21.0,<2.0
+scikit-learn>=1.3.0
+torch>=1.13.0
+transformers>=4.30.0
+datasets>=2.10.0
+sentence-transformers>=2.2.0
+
+# AutoML and optimization
+optuna>=3.2.0
 neural-pipeline-search==0.13.0
 
-# Utilities
+# Traditional ML models
+xgboost>=1.7.0
+lightgbm>=3.3.0
+catboost>=1.1.0  # Optional but recommended
+
+# Text processing and embeddings
+nltk>=3.8
+spacy>=3.4.0
+gensim>=4.3.0  # For Word2Vec, FastText
+tokenizers>=0.13.0
+
+# Data handling and utilities
+pandas>=1.5.0
+scipy>=1.9.0
+tqdm>=4.65.0
 pyyaml>=6.0
 toml>=0.10.2
 pyarrow>=12.0
+
+# Visualization and analysis
+matplotlib>=3.5.0
+seaborn>=0.12.0
+
+# Additional NLP tools
+textaugment>=1.3.4  # For augmentation
+sacremoses>=0.0.53  # For tokenization
+sentencepiece>=0.1.96  # For subword tokenization
+
+# Development and testing
+pytest>=7.2.0
 ipython>=8.0
+jupyter>=1.0.0
 
-# Additional dependencies for improvements
-nltk>=3.8  # For text preprocessing
-scipy>=1.9  # For sparse matrix operations
-tqdm>=4.60  # For progress bars
-pandas>=1.3  # For data handling
+# Optional advanced features
+# adapter-transformers>=3.2.0  # For adapter-based fine-tuning
+# peft>=0.3.0  # For parameter-efficient fine-tuning (LoRA)
+# bitsandbytes>=0.38.0  # For 8-bit optimization
+# accelerate>=0.20.0  # For distributed training
 
-# Optional: Transformers adapters (if available)
-# adapter-transformers>=3.0  # Uncomment if using adapters
+# Specific model requirements
+# For back-translation augmentation
+# torch-translate>=0.1.0  # Optional
+# fairseq>=0.12.0  # Optional
+
+# System-specific (install separately if needed)
+# apex  # For mixed precision training (NVIDIA GPUs)
+# deepspeed>=0.9.0  # For large model training
