@@ -39,6 +39,7 @@ import logging
 import numpy as np
 from pathlib import Path
 from sklearn.metrics import accuracy_score, classification_report
+from typing import List
 import yaml
 
 from automl.core import TextAutoML
@@ -68,6 +69,11 @@ def main_loop(
         lr: float = 0.0001,
         weight_decay: float = 0.01,
         ffnn_hidden: int = 128,
+        use_enhanced_ffnn: bool = False,
+        ffnn_num_layers: int = 3,
+        ffnn_dropout_rate: float = 0.1,
+        ffnn_use_residual: bool = True,
+        ffnn_use_layer_norm: bool = True,
         lstm_emb_dim: int = 128,
         lstm_hidden_dim: int = 128,
         fraction_layers_to_finetune: float = 1.0,
@@ -87,6 +93,16 @@ def main_loop(
         neps_max_evaluations: int = 16,
         neps_timeout: int = 7200,
         neps_searcher: str = 'bayesian_optimization',
+        # Ensemble parameters
+        use_ensemble: bool = False,
+        ensemble_methods: List[str] = None,
+        ensemble_type: str = 'auto',
+        individual_trials: int = 5,
+        # Augmentation parameters
+        use_augmentation: bool = False,
+        augmentation_strength: str = 'medium',
+        augmentation_factor: float = 0.5,
+        balance_augmentation: bool = True,
     ) -> None:
     match dataset:
         case "ag_news":
@@ -138,16 +154,43 @@ def main_loop(
         lr=lr,
         weight_decay=weight_decay,
         ffnn_hidden=ffnn_hidden,
+        use_enhanced_ffnn=use_enhanced_ffnn,
+        ffnn_num_layers=ffnn_num_layers,
+        ffnn_dropout_rate=ffnn_dropout_rate,
+        ffnn_use_residual=ffnn_use_residual,
+        ffnn_use_layer_norm=ffnn_use_layer_norm,
         lstm_emb_dim=lstm_emb_dim,
         lstm_hidden_dim=lstm_hidden_dim,
         fraction_layers_to_finetune=fraction_layers_to_finetune,
         hpo_sampler=hpo_sampler,
         hpo_pruner=hpo_pruner,
         use_multi_fidelity=use_multi_fidelity,
+        dataset_name=dataset,  # Pass dataset name for dataset-specific optimization
+        use_augmentation=use_augmentation,
+        augmentation_strength=augmentation_strength,
+        augmentation_factor=augmentation_factor,
+        balance_augmentation=balance_augmentation,
     )
 
+    # Check if ensemble training should be used
+    if use_ensemble:
+        logger.info("Using ensemble training")
+        
+        # Set default ensemble methods if not provided
+        if ensemble_methods is None:
+            ensemble_methods = ['logistic', 'ffnn']  # Conservative default for speed
+            
+        val_err = automl.fit_with_ensemble(
+            train_df,
+            val_df,
+            num_classes=num_classes,
+            ensemble_methods=ensemble_methods,
+            ensemble_type=ensemble_type,
+            individual_trials=individual_trials,
+            save_path=output_path,
+        )
     # Check if NEPS auto-approach selection should be used
-    if use_neps_auto_approach:
+    elif use_neps_auto_approach:
         logger.info("Using NEPS automatic approach selection")
         logger.info("NEPS will select the best approach and optimization strategy automatically")
         logger.info("Existing Optuna methods will be used internally for optimization")
@@ -214,7 +257,11 @@ def main_loop(
     logger.info("Training complete")
 
     # Predict on the test set
-    test_preds, test_labels = automl.predict(test_df)
+    if use_ensemble and hasattr(automl, 'ensemble'):
+        test_preds = automl.predict_ensemble(test_df)
+        test_labels = test_df['label'].values
+    else:
+        test_preds, test_labels = automl.predict(test_df)
 
     # Write the predictions of X_test to disk
     logger.info("Writing predictions to disk")
@@ -360,6 +407,37 @@ if __name__ == "__main__":
         default=64,
         help="The hidden size to use for the model."
     )
+    
+    # Enhanced FFNN arguments
+    parser.add_argument(
+        "--use-enhanced-ffnn",
+        action="store_true",
+        help="Use enhanced FFNN with residual connections and layer normalization."
+    )
+    parser.add_argument(
+        "--ffnn-num-layers",
+        type=int,
+        default=3,
+        help="Number of layers for enhanced FFNN."
+    )
+    parser.add_argument(
+        "--ffnn-dropout-rate",
+        type=float,
+        default=0.1,
+        help="Dropout rate for enhanced FFNN."
+    )
+    parser.add_argument(
+        "--ffnn-use-residual",
+        action="store_true",
+        default=True,
+        help="Use residual connections in enhanced FFNN."
+    )
+    parser.add_argument(
+        "--ffnn-use-layer-norm",
+        action="store_true", 
+        default=True,
+        help="Use layer normalization in enhanced FFNN."
+    )
 
     parser.add_argument(
         "--data-fraction",
@@ -446,6 +524,60 @@ if __name__ == "__main__":
         choices=["bayesian_optimization", "evolutionary_search", "random_search"],
         help="NEPS searcher algorithm for approach selection."
     )
+    
+    # Ensemble arguments
+    parser.add_argument(
+        "--use-ensemble",
+        action="store_true",
+        help="Train ensemble of multiple models for better performance."
+    )
+    parser.add_argument(
+        "--ensemble-methods",
+        type=str,
+        nargs="+",
+        default=None,
+        choices=["logistic", "ffnn", "lstm", "transformer"],
+        help="List of methods to include in ensemble (default: logistic ffnn)."
+    )
+    parser.add_argument(
+        "--ensemble-type",
+        type=str,
+        default="auto",
+        choices=["voting", "stacking", "weighted", "auto"],
+        help="Type of ensemble method to use."
+    )
+    parser.add_argument(
+        "--individual-trials",
+        type=int,
+        default=5,
+        help="Number of HPO trials for each individual model in ensemble."
+    )
+    
+    # Augmentation arguments
+    parser.add_argument(
+        "--use-augmentation",
+        action="store_true",
+        help="Enable text augmentation for training data."
+    )
+    parser.add_argument(
+        "--augmentation-strength",
+        type=str,
+        default="medium",
+        choices=["light", "medium", "heavy"],
+        help="Strength of text augmentation."
+    )
+    parser.add_argument(
+        "--augmentation-factor",
+        type=float,
+        default=0.5,
+        help="Fraction of training data to augment (0.0-1.0)."
+    )
+    parser.add_argument(
+        "--balance-augmentation",
+        action="store_true",
+        default=True,
+        help="Augment minority classes more to balance dataset."
+    )
 
     args = parser.parse_args()
 
@@ -479,6 +611,11 @@ if __name__ == "__main__":
         lr=args.lr,
         weight_decay=args.weight_decay,
         ffnn_hidden=args.ffnn_hidden_layer_dim,
+        use_enhanced_ffnn=args.use_enhanced_ffnn,
+        ffnn_num_layers=args.ffnn_num_layers,
+        ffnn_dropout_rate=args.ffnn_dropout_rate,
+        ffnn_use_residual=args.ffnn_use_residual,
+        ffnn_use_layer_norm=args.ffnn_use_layer_norm,
         lstm_emb_dim=args.lstm_emb_dim,
         lstm_hidden_dim=args.lstm_hidden_dim,
         data_fraction=args.data_fraction,
@@ -497,5 +634,15 @@ if __name__ == "__main__":
         neps_max_evaluations=args.neps_max_evaluations,
         neps_timeout=args.neps_timeout,
         neps_searcher=args.neps_searcher,
+        # Ensemble parameters
+        use_ensemble=args.use_ensemble,
+        ensemble_methods=args.ensemble_methods,
+        ensemble_type=args.ensemble_type,
+        individual_trials=args.individual_trials,
+        # Augmentation parameters
+        use_augmentation=args.use_augmentation,
+        augmentation_strength=args.augmentation_strength,
+        augmentation_factor=args.augmentation_factor,
+        balance_augmentation=args.balance_augmentation,
     )
 # end of file

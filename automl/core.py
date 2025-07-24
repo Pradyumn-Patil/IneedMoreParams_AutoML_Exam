@@ -7,14 +7,17 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import accuracy_score
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
-from automl.models import SimpleFFNN, LSTMClassifier, NASSearchableFFNN, NASSearchableLSTM, NASSearchSpace
-from automl.utils import SimpleTextDataset
+from automl.models import SimpleFFNN, EnhancedFFNN, LSTMClassifier, NASSearchableFFNN, NASSearchableLSTM, NASSearchSpace
+from automl.utils import SimpleTextDataset, TextPreprocessor
+from automl.progress_utils import ProgressTracker, DataLoadingProgress, HPOProgress, create_batch_progress_bar
+from automl.augmentation import TextAugmenter, DatasetAugmenter, create_augmenter
 from pathlib import Path
 import logging
 import time
-from typing import Tuple
+from typing import Tuple, List
 from collections import Counter
 import yaml
+from tqdm import tqdm
 
 try:
     import optuna
@@ -25,10 +28,25 @@ except ImportError:
     OPTUNA_AVAILABLE = False
 
 try:
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    from transformers import (
+        AutoTokenizer, 
+        AutoModelForSequenceClassification,
+        RobertaTokenizer,
+        RobertaForSequenceClassification,
+        AlbertTokenizer,
+        AlbertForSequenceClassification,
+        DistilBertTokenizer,
+        DistilBertForSequenceClassification,
+    )
     TRANSFORMERS_AVAILABLE = True
+    try:
+        from transformers.adapters import AdapterConfig, AdapterType
+        ADAPTERS_AVAILABLE = True
+    except ImportError:
+        ADAPTERS_AVAILABLE = False
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
+    ADAPTERS_AVAILABLE = False
 
 try:
     import neps
@@ -50,6 +68,11 @@ class TextAutoML:
         lr=1e-4,
         weight_decay=0.0,
         ffnn_hidden=128,
+        use_enhanced_ffnn=False,  # Use EnhancedFFNN with residual connections
+        ffnn_num_layers=3,  # Number of layers for enhanced FFNN
+        ffnn_dropout_rate=0.1,  # Dropout rate for enhanced FFNN
+        ffnn_use_residual=True,  # Use residual connections
+        ffnn_use_layer_norm=True,  # Use layer normalization
         lstm_emb_dim=128,
         lstm_hidden_dim=128,
         fraction_layers_to_finetune: float=1.0,
@@ -60,6 +83,19 @@ class TextAutoML:
         hpo_sampler='tpe',  # 'tpe', 'random', 'cmaes', 'nsga2'
         hpo_pruner='median',  # 'median', 'successive_halving', 'hyperband'
         use_multi_fidelity=True,  # Enable/disable multi-fidelity optimization
+        # Preprocessing parameters
+        dataset_name=None,  # For dataset-specific preprocessing
+        use_preprocessing=True,  # Enable/disable preprocessing
+        custom_preprocessor=None,  # Custom preprocessor instance
+        # Transformer parameters
+        transformer_model='distilbert-base-uncased',  # Model name or path
+        use_adapters=False,  # Use adapter layers for efficient fine-tuning
+        adapter_reduction_factor=16,  # Adapter bottleneck dimension
+        # Augmentation parameters
+        use_augmentation=False,  # Enable text augmentation
+        augmentation_strength='medium',  # 'light', 'medium', 'heavy'
+        augmentation_factor=0.5,  # Fraction of data to augment
+        balance_augmentation=True,  # Augment minority classes more
     ):
         self.seed = seed
         np.random.seed(seed)
@@ -75,6 +111,11 @@ class TextAutoML:
         self.weight_decay = weight_decay
 
         self.ffnn_hidden = ffnn_hidden
+        self.use_enhanced_ffnn = use_enhanced_ffnn
+        self.ffnn_num_layers = ffnn_num_layers
+        self.ffnn_dropout_rate = ffnn_dropout_rate
+        self.ffnn_use_residual = ffnn_use_residual
+        self.ffnn_use_layer_norm = ffnn_use_layer_norm
         self.lstm_emb_dim = lstm_emb_dim
         self.lstm_hidden_dim = lstm_hidden_dim
         self.fraction_layers_to_finetune = fraction_layers_to_finetune
@@ -87,13 +128,36 @@ class TextAutoML:
         self.hpo_sampler = hpo_sampler
         self.hpo_pruner = hpo_pruner  # 'median', 'successive_halving', 'hyperband'
         self.use_multi_fidelity = use_multi_fidelity  # Enable/disable multi-fidelity optimization
+        self.class_weights = None  # For handling class imbalance
         
         # NAS parameters
         self.use_nas = False  # Enable/disable neural architecture search
+        
+        # Preprocessing parameters
+        self.dataset_name = dataset_name
+        self.use_preprocessing = use_preprocessing
+        if custom_preprocessor:
+            self.preprocessor = custom_preprocessor
+        elif use_preprocessing:
+            self.preprocessor = TextPreprocessor.get_dataset_specific_preprocessor(dataset_name) if dataset_name else TextPreprocessor()
+        else:
+            self.preprocessor = None
+            
+        # Transformer parameters
+        self.transformer_model = transformer_model
+        self.use_adapters = use_adapters
+        self.adapter_reduction_factor = adapter_reduction_factor
+        
+        # Augmentation parameters
+        self.use_augmentation = use_augmentation
+        self.augmentation_strength = augmentation_strength
+        self.augmentation_factor = augmentation_factor
+        self.balance_augmentation = balance_augmentation
 
         self.model = None
         self.tokenizer = None
         self.vectorizer = None
+        self.char_vectorizer = None  # For character n-grams
         self.num_classes = None
         self.train_texts = []
         self.train_labels = []
@@ -156,29 +220,116 @@ class TextAutoML:
         if lstm_hidden_dim is not None: self.lstm_hidden_dim = lstm_hidden_dim
         if fraction_layers_to_finetune is not None: self.fraction_layers_to_finetune = fraction_layers_to_finetune
         
-        logger.info("Loading and preparing data...")
-
+        # Data loading progress
+        data_progress = DataLoadingProgress(self.dataset_name)
+        
         self.train_texts = train_df['text'].tolist()
         self.train_labels = train_df['label'].tolist()
+        data_progress.update("Training data loaded", len(self.train_texts))
+        
         self.val_texts = val_df['text'].tolist()
         self.val_labels = val_df['label'].tolist()
+        data_progress.update("Validation data loaded", len(self.val_texts))
+        
+        # Apply preprocessing if enabled
+        if self.preprocessor:
+            data_progress.update("Applying text preprocessing...")
+            self.train_texts = self.preprocessor.preprocess_batch(self.train_texts)
+            self.val_texts = self.preprocessor.preprocess_batch(self.val_texts)
+            data_progress.update("Preprocessing completed")
+        
+        # Apply augmentation if enabled
+        if self.use_augmentation:
+            data_progress.update("Applying text augmentation...")
+            augmenter = create_augmenter(self.dataset_name, self.augmentation_strength)
+            dataset_augmenter = DatasetAugmenter(
+                augmenter, 
+                augmentation_factor=self.augmentation_factor,
+                balance_classes=self.balance_augmentation
+            )
+            
+            # Augment training data only (not validation)
+            self.train_texts, self.train_labels = dataset_augmenter.augment_dataset(
+                self.train_texts, 
+                self.train_labels,
+                max_augmentations_per_sample=3
+            )
+            data_progress.update(f"Augmentation completed - {len(self.train_texts)} samples")
+        
+        data_progress.finish()
+            
         self.num_classes = num_classes
         logger.info(f"Train class distribution: {Counter(self.train_labels)}")
         logger.info(f"Val class distribution: {Counter(self.val_labels)}")
+        
+        # Calculate class weights for imbalanced datasets
+        train_counter = Counter(self.train_labels)
+        total_samples = len(self.train_labels)
+        self.class_weights = {}
+        for label, count in train_counter.items():
+            weight = total_samples / (len(train_counter) * count)
+            self.class_weights[label] = weight
+        
+        # Check for significant imbalance
+        max_weight = max(self.class_weights.values())
+        min_weight = min(self.class_weights.values())
+        imbalance_ratio = max_weight / min_weight
+        
+        if imbalance_ratio > 2:
+            logger.info(f"Class imbalance detected (ratio: {imbalance_ratio:.2f})")
+            logger.info(f"Class weights: {self.class_weights}")
+            # Convert to tensor for PyTorch
+            weight_tensor = torch.zeros(num_classes)
+            for label, weight in self.class_weights.items():
+                weight_tensor[label] = weight
+            self.class_weight_tensor = weight_tensor.to(self.device)
+        else:
+            logger.info("Dataset is relatively balanced")
+            self.class_weight_tensor = None
 
         dataset = None
         if self.approach in ['ffnn', 'logistic']:
-            # Both use TF-IDF vectorization
+            # Both use TF-IDF vectorization with enhanced features
+            # Adaptive max_features based on dataset size
+            dataset_size = len(self.train_texts)
+            adaptive_max_features = min(self.vocab_size, max(5000, dataset_size // 10))
+            
             self.vectorizer = TfidfVectorizer(
-                max_features=self.vocab_size,
+                max_features=adaptive_max_features,
                 lowercase=True,
                 min_df=2,    # ignore words appearing in less than 2 sentences
                 max_df=0.8,  # ignore words appearing in > 80% of sentences
                 sublinear_tf=True,  # use log-spaced term-frequency scoring
-                ngram_range=(1, 2),  # unigrams and bigrams
+                ngram_range=(1, 3),  # unigrams, bigrams, and trigrams for better context
+                analyzer='word',     # word-level analysis
+                strip_accents='unicode',  # handle accented characters
+                decode_error='ignore',    # ignore decode errors
+                token_pattern=r'\b\w+\b',  # improved token pattern
             )
-            X_train = self.vectorizer.fit_transform(self.train_texts)
-            X_val = self.vectorizer.transform(self.val_texts)
+            
+            # Also create a character-level TF-IDF vectorizer
+            self.char_vectorizer = TfidfVectorizer(
+                max_features=min(5000, adaptive_max_features // 2),  # fewer features for char n-grams
+                lowercase=True,
+                analyzer='char',
+                ngram_range=(3, 5),  # character 3-grams to 5-grams
+                min_df=2,
+                max_df=0.8,
+                sublinear_tf=True,
+            )
+            # Fit both word and character vectorizers
+            X_train_word = self.vectorizer.fit_transform(self.train_texts)
+            X_val_word = self.vectorizer.transform(self.val_texts)
+            
+            X_train_char = self.char_vectorizer.fit_transform(self.train_texts)
+            X_val_char = self.char_vectorizer.transform(self.val_texts)
+            
+            # Combine word and character features
+            from scipy.sparse import hstack
+            X_train = hstack([X_train_word, X_train_char])
+            X_val = hstack([X_val_word, X_val_char])
+            
+            logger.info(f"Combined TF-IDF features: {X_train.shape[1]} dimensions")
             
             if self.approach == 'ffnn':
                 # Convert to dense arrays for PyTorch
@@ -195,9 +346,20 @@ class TextAutoML:
                     torch.tensor(self.val_labels)
                 )
                 val_loader = DataLoader(_dataset, batch_size=self.batch_size, shuffle=True)
-                self.model = SimpleFFNN(
-                    X_train_dense.shape[1], hidden=self.ffnn_hidden, output_dim=self.num_classes
-                )
+                if self.use_enhanced_ffnn:
+                    self.model = EnhancedFFNN(
+                        X_train_dense.shape[1], 
+                        hidden=self.ffnn_hidden, 
+                        output_dim=self.num_classes,
+                        num_layers=self.ffnn_num_layers,
+                        dropout_rate=self.ffnn_dropout_rate,
+                        use_residual=self.ffnn_use_residual,
+                        use_layer_norm=self.ffnn_use_layer_norm
+                    )
+                else:
+                    self.model = SimpleFFNN(
+                        X_train_dense.shape[1], hidden=self.ffnn_hidden, output_dim=self.num_classes
+                    )
             elif self.approach == 'logistic': 
                 # Use sklearn LogisticRegression directly with sparse matrices
                 self.model = LogisticRegression(
@@ -209,7 +371,8 @@ class TextAutoML:
                 train_loader = val_loader = None  # Not used for sklearn model
 
         elif self.approach in ['lstm', 'transformer']:
-            model_name = 'distilbert-base-uncased'
+            # Use configured transformer model for tokenizer
+            model_name = self.transformer_model if self.approach == 'transformer' else 'distilbert-base-uncased'
             self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             self.vocab_size = self.tokenizer.vocab_size
             dataset = SimpleTextDataset(
@@ -231,11 +394,15 @@ class TextAutoML:
                     )
                 case "transformer":
                     if TRANSFORMERS_AVAILABLE:
-                        self.model = AutoModelForSequenceClassification.from_pretrained(
-                            model_name, 
-                            num_labels=self.num_classes
-                        )
-                        self._freeze_layers(self.model, self.fraction_layers_to_finetune)  
+                        # Load the appropriate transformer model
+                        self.model = self._create_transformer_model(model_name, self.num_classes)
+                        
+                        # Add adapters if requested
+                        if self.use_adapters and ADAPTERS_AVAILABLE:
+                            self._add_adapters_to_model(self.model)
+                        else:
+                            # Standard fine-tuning with layer freezing
+                            self._freeze_layers(self.model, self.fraction_layers_to_finetune)
                     else:
                         raise ValueError(
                             "Need `AutoTokenizer`, `AutoModelForSequenceClassification` "
@@ -249,15 +416,34 @@ class TextAutoML:
         # Training and validating
         if self.approach == 'logistic':
             # For sklearn LogisticRegression, training is different
-            X_train = self.vectorizer.transform(self.train_texts)
-            X_val = self.vectorizer.transform(self.val_texts)
+            from scipy.sparse import hstack
             
-            logger.info("Training Logistic Regression model...")
+            # Transform with both word and character features
+            X_train_word = self.vectorizer.transform(self.train_texts)
+            X_train_char = self.char_vectorizer.transform(self.train_texts)
+            X_train = hstack([X_train_word, X_train_char])
+            
+            X_val_word = self.vectorizer.transform(self.val_texts)
+            X_val_char = self.char_vectorizer.transform(self.val_texts)
+            X_val = hstack([X_val_word, X_val_char])
+            
+            print(f"\n🔧 Training Logistic Regression with combined TF-IDF features...")
+            print(f"   Feature dimensions: {X_train.shape[1]} (word: {X_train_word.shape[1]}, char: {X_train_char.shape[1]})")
+            print(f"   Training samples: {X_train.shape[0]}")
+            
+            # Simple progress indicator for sklearn
+            print("   Training...", end="", flush=True)
+            start_time = time.time()
             self.model.fit(X_train, self.train_labels)
+            train_time = time.time() - start_time
+            print(f" ✓ Completed in {train_time:.1f}s")
             
             # Evaluate on validation set
+            print("   Evaluating...", end="", flush=True)
             val_preds = self.model.predict(X_val)
             val_acc = accuracy_score(self.val_labels, val_preds)
+            print(f" ✓ Validation Accuracy: {val_acc:.4f}")
+            
             logger.info(f"Validation Accuracy: {val_acc:.4f}")
             
             return 1 - val_acc
@@ -283,7 +469,13 @@ class TextAutoML:
         trial=None,  # For multi-fidelity HPO
     ):
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        criterion = nn.CrossEntropyLoss()
+        
+        # Use weighted loss if class imbalance is detected
+        if hasattr(self, 'class_weight_tensor') and self.class_weight_tensor is not None:
+            criterion = nn.CrossEntropyLoss(weight=self.class_weight_tensor)
+            logger.info("Using weighted CrossEntropyLoss for imbalanced data")
+        else:
+            criterion = nn.CrossEntropyLoss()
 
         start_epoch = 0
         # handling checkpoint resume
@@ -322,9 +514,20 @@ class TextAutoML:
             else:
                 logger.warning(f"No checkpoint files found in {load_path}")
 
-        for epoch in range(start_epoch, self.epochs):            
+        # Initialize progress tracker
+        progress = ProgressTracker(
+            self.epochs, 
+            self.dataset_name, 
+            self.approach,
+            extra_info=f"batch_size={self.batch_size}, lr={self.lr}"
+        )
+        
+        for epoch in range(start_epoch, self.epochs):
+            progress.start_epoch(epoch)
             total_loss = 0
-            for batch in train_loader:
+            batch_progress = create_batch_progress_bar(train_loader, f"Epoch {epoch+1}/{self.epochs}")
+            
+            for batch in batch_progress:
                 self.model.train()
                 optimizer.zero_grad()
 
@@ -353,41 +556,49 @@ class TextAutoML:
                 optimizer.step()
                 total_loss += loss.item()
 
-            logger.info(f"Epoch {epoch + 1}, Loss: {total_loss:.4f}")
-
-            # Multi-fidelity HPO: report intermediate values and check for pruning
-            if trial is not None and self.val_texts and self.use_multi_fidelity:
+            # Validation
+            if self.val_texts:
                 val_preds, val_labels = self._predict(val_loader)
                 val_acc = accuracy_score(val_labels, val_preds)
                 val_error = 1 - val_acc
                 
-                # Report intermediate value to Optuna for pruning
-                trial.report(val_error, epoch)
-                    
-                # Check if trial should be pruned
-                if trial.should_prune():
-                    # Get study to compare with other trials
-                    study = trial.study
-                    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
-                    
-                    # Concise pruning log
-                    best_error = min(t.value for t in completed_trials) if completed_trials else "N/A"
-                    logger.info(f"Trial #{trial.number} PRUNED at epoch {epoch + 1} | "
-                              f"Error: {val_error:.4f} | Pruner: {self.hpo_pruner} | "
-                              f"Best so far: {best_error if best_error == 'N/A' else f'{best_error:.4f}'}")
-                    
-                    raise optuna.exceptions.TrialPruned()
+                # Update progress with metrics
+                metrics = {
+                    "Loss": total_loss,
+                    "Val Acc": val_acc
+                }
+                progress.end_epoch(epoch, metrics)
                 
-                logger.info(f"Trial {trial.number} continues - performance is promising")
-            elif self.val_texts:
-                val_preds, val_labels = self._predict(val_loader)
-                val_acc = accuracy_score(val_labels, val_preds)
-                logger.info(f"Epoch {epoch + 1}, Validation Accuracy: {val_acc:.4f}")
+                # Multi-fidelity HPO: report intermediate values and check for pruning
+                if trial is not None and self.use_multi_fidelity:
+                    # Report intermediate value to Optuna for pruning
+                    trial.report(val_error, epoch)
+                        
+                    # Check if trial should be pruned
+                    if trial.should_prune():
+                        # Get study to compare with other trials
+                        study = trial.study
+                        completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+                        
+                        # Concise pruning log
+                        best_error = min(t.value for t in completed_trials) if completed_trials else "N/A"
+                        logger.info(f"Trial #{trial.number} PRUNED at epoch {epoch + 1} | "
+                                  f"Error: {val_error:.4f} | Pruner: {self.hpo_pruner} | "
+                                  f"Best so far: {best_error if best_error == 'N/A' else f'{best_error:.4f}'}")
+                        
+                        raise optuna.exceptions.TrialPruned()
+            else:
+                # No validation data, just show loss
+                metrics = {"Loss": total_loss}
+                progress.end_epoch(epoch, metrics)
 
+        # Final validation
         if self.val_texts:
             val_preds, val_labels = self._predict(val_loader)
             val_acc = accuracy_score(val_labels, val_preds)
-            logger.info(f"Epoch {epoch + 1}, Validation Accuracy: {val_acc:.4f}")
+            progress.finish({"Validation Accuracy": val_acc})
+        else:
+            progress.finish()
 
         if save_path is not None:
             save_path = Path(save_path) if not isinstance(save_path, Path) else save_path
@@ -453,14 +664,33 @@ class TextAutoML:
             return self._predict(test_data)
         
         if self.approach == 'logistic':
-            # For sklearn LogisticRegression
-            _X = self.vectorizer.transform(test_data['text'].tolist())
+            # For sklearn LogisticRegression with combined features
+            from scipy.sparse import hstack
+            test_texts = test_data['text'].tolist()
+            
+            # Apply preprocessing if enabled
+            if self.preprocessor:
+                test_texts = self.preprocessor.preprocess_batch(test_texts)
+                
+            _X_word = self.vectorizer.transform(test_texts)
+            _X_char = self.char_vectorizer.transform(test_texts)
+            _X = hstack([_X_word, _X_char])
             _labels = test_data['label'].tolist()
             _preds = self.model.predict(_X)
             return np.array(_preds), np.array(_labels)
             
         elif self.approach == 'ffnn':
-            _X = self.vectorizer.transform(test_data['text'].tolist()).toarray()
+            # Transform with both word and character features
+            from scipy.sparse import hstack
+            test_texts = test_data['text'].tolist()
+            
+            # Apply preprocessing if enabled
+            if self.preprocessor:
+                test_texts = self.preprocessor.preprocess_batch(test_texts)
+                
+            _X_word = self.vectorizer.transform(test_texts)
+            _X_char = self.char_vectorizer.transform(test_texts)
+            _X = hstack([_X_word, _X_char]).toarray()
             _labels = test_data['label'].tolist()
             _dataset = torch.utils.data.TensorDataset(
                 torch.tensor(_X, dtype=torch.float32),
@@ -470,8 +700,14 @@ class TextAutoML:
             return self._predict(_loader)
             
         elif self.approach in ['lstm', 'transformer']:
+            test_texts = test_data['text'].tolist()
+            
+            # Apply preprocessing if enabled (for LSTM/transformer too)
+            if self.preprocessor and self.approach == 'lstm':
+                test_texts = self.preprocessor.preprocess_batch(test_texts)
+                
             _dataset = SimpleTextDataset(
-                test_data['text'].tolist(),
+                test_texts,
                 test_data['label'].tolist(),
                 self.tokenizer,
                 self.token_length
@@ -484,15 +720,83 @@ class TextAutoML:
 
     def _freeze_layers(self, model, fraction_layers_to_finetune: float = 1.0) -> None:
         """Freeze layers in transformer model for partial fine-tuning."""
-        total_layers = len(model.distilbert.transformer.layer)
+        # Get the transformer layers based on model architecture
+        if hasattr(model, 'distilbert'):
+            layers = model.distilbert.transformer.layer
+        elif hasattr(model, 'roberta'):
+            layers = model.roberta.encoder.layer
+        elif hasattr(model, 'albert'):
+            layers = model.albert.encoder.albert_layer_groups[0].albert_layers
+        elif hasattr(model, 'bert'):
+            layers = model.bert.encoder.layer
+        else:
+            logger.warning("Unknown model architecture, skipping layer freezing")
+            return
+            
+        total_layers = len(layers)
         _num_layers_to_finetune = int(fraction_layers_to_finetune * total_layers)
         layers_to_freeze = total_layers - _num_layers_to_finetune
 
-        for layer in model.distilbert.transformer.layer[:layers_to_freeze]:
+        for layer in layers[:layers_to_freeze]:
             for param in layer.parameters():
                 param.requires_grad = False
                 
         logger.info(f"Froze {layers_to_freeze}/{total_layers} layers, fine-tuning {_num_layers_to_finetune} layers")
+    
+    def _create_transformer_model(self, model_name: str, num_labels: int):
+        """Create a transformer model with support for different architectures."""
+        logger.info(f"Loading transformer model: {model_name}")
+        
+        # Map of model names to specific model classes for better control
+        model_mapping = {
+            'distilbert': DistilBertForSequenceClassification,
+            'roberta': RobertaForSequenceClassification,
+            'albert': AlbertForSequenceClassification,
+        }
+        
+        # Determine which model class to use
+        model_class = AutoModelForSequenceClassification
+        for key, cls in model_mapping.items():
+            if key in model_name.lower():
+                model_class = cls
+                break
+                
+        # Load the model
+        model = model_class.from_pretrained(model_name, num_labels=num_labels)
+        
+        # Log model info
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"Model loaded with {total_params:,} total parameters, {trainable_params:,} trainable")
+        
+        return model
+    
+    def _add_adapters_to_model(self, model):
+        """Add adapter layers to the transformer model for efficient fine-tuning."""
+        if not ADAPTERS_AVAILABLE:
+            logger.warning("Adapters not available, falling back to standard fine-tuning")
+            self._freeze_layers(model, self.fraction_layers_to_finetune)
+            return
+            
+        logger.info(f"Adding adapters with reduction factor: {self.adapter_reduction_factor}")
+        
+        # Add adapter configuration
+        adapter_config = AdapterConfig.load(
+            "pfeiffer",  # Use Pfeiffer adapter architecture
+            non_linearity="relu",
+            reduction_factor=self.adapter_reduction_factor
+        )
+        
+        # Add the adapter
+        model.add_adapter("text_classification", config=adapter_config)
+        model.set_active_adapters("text_classification")
+        
+        # Train only the adapter weights
+        model.train_adapter("text_classification")
+        
+        # Log adapter info
+        adapter_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"Added adapters with {adapter_params:,} trainable parameters")
 
     def _create_hpo_search_space(self, trial):
         """Create hyperparameter search space for the current approach."""
@@ -501,35 +805,96 @@ class TextAutoML:
             
         params = {}
         
+        # Dataset-specific adjustments
+        dataset_configs = {
+            'amazon': {
+                'vocab_range': (5000, 15000),  # Medium vocabulary
+                'batch_sizes': [32, 64, 128],  # Larger batches OK
+                'epochs_range': (3, 10),
+                'token_length_range': (64, 256),  # Medium sequences
+            },
+            'imdb': {
+                'vocab_range': (10000, 30000),  # Larger vocabulary for sentiment
+                'batch_sizes': [16, 32, 64],  # Smaller batches due to longer texts
+                'epochs_range': (3, 12),
+                'token_length_range': (128, 512),  # Longer sequences
+            },
+            'ag_news': {
+                'vocab_range': (5000, 20000),  # News vocabulary
+                'batch_sizes': [64, 128, 256],  # Can handle larger batches
+                'epochs_range': (2, 8),
+                'token_length_range': (64, 192),  # Shorter sequences
+            },
+            'dbpedia': {
+                'vocab_range': (10000, 40000),  # Large vocabulary for ontologies
+                'batch_sizes': [64, 128, 256],  # Large dataset, bigger batches
+                'epochs_range': (2, 6),
+                'token_length_range': (96, 256),  # Medium sequences
+            },
+        }
+        
+        # Get dataset-specific config or use defaults
+        dataset_config = dataset_configs.get(self.dataset_name, {
+            'vocab_range': (5000, 20000),
+            'batch_sizes': [32, 64, 128],
+            'epochs_range': (3, 10),
+            'token_length_range': (64, 256),
+        })
+        
         if self.approach == 'logistic':
             params['logistic_C'] = trial.suggest_float('logistic_C', 0.001, 100.0, log=True)
             params['logistic_max_iter'] = trial.suggest_int('logistic_max_iter', 100, 2000)
-            params['vocab_size'] = trial.suggest_int('vocab_size', 5000, 20000)
+            params['vocab_size'] = trial.suggest_int('vocab_size', *dataset_config['vocab_range'])
             
         elif self.approach == 'ffnn':
             params['lr'] = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
             params['weight_decay'] = trial.suggest_float('weight_decay', 0.0, 0.1)
-            params['batch_size'] = trial.suggest_categorical('batch_size', [16, 32, 64, 128])
+            params['batch_size'] = trial.suggest_categorical('batch_size', dataset_config['batch_sizes'])
             params['ffnn_hidden'] = trial.suggest_int('ffnn_hidden', 64, 512)
-            params['epochs'] = trial.suggest_int('epochs', 3, 15)
-            params['vocab_size'] = trial.suggest_int('vocab_size', 5000, 20000)
+            params['epochs'] = trial.suggest_int('epochs', *dataset_config['epochs_range'])
+            params['vocab_size'] = trial.suggest_int('vocab_size', *dataset_config['vocab_range'])
+            
+            # Enhanced FFNN parameters (only if enhanced FFNN is enabled)
+            if self.use_enhanced_ffnn:
+                params['ffnn_num_layers'] = trial.suggest_int('ffnn_num_layers', 2, 5)
+                params['ffnn_dropout_rate'] = trial.suggest_float('ffnn_dropout_rate', 0.0, 0.5)
+                params['ffnn_use_residual'] = trial.suggest_categorical('ffnn_use_residual', [True, False])
+                params['ffnn_use_layer_norm'] = trial.suggest_categorical('ffnn_use_layer_norm', [True, False])
             
         elif self.approach == 'lstm':
             params['lr'] = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
             params['weight_decay'] = trial.suggest_float('weight_decay', 0.0, 0.1)
-            params['batch_size'] = trial.suggest_categorical('batch_size', [16, 32, 64])
+            params['batch_size'] = trial.suggest_categorical('batch_size', 
+                [bs // 2 for bs in dataset_config['batch_sizes']])  # LSTM needs smaller batches
             params['lstm_emb_dim'] = trial.suggest_int('lstm_emb_dim', 64, 256)
             params['lstm_hidden_dim'] = trial.suggest_int('lstm_hidden_dim', 64, 256)
-            params['epochs'] = trial.suggest_int('epochs', 3, 15)
-            params['token_length'] = trial.suggest_int('token_length', 64, 256)
+            params['epochs'] = trial.suggest_int('epochs', *dataset_config['epochs_range'])
+            params['token_length'] = trial.suggest_int('token_length', *dataset_config['token_length_range'])
             
         elif self.approach == 'transformer':
             params['lr'] = trial.suggest_float('lr', 1e-6, 1e-3, log=True)
             params['weight_decay'] = trial.suggest_float('weight_decay', 0.0, 0.1)
-            params['batch_size'] = trial.suggest_categorical('batch_size', [8, 16, 32])
+            # Transformers need smaller batches
+            transformer_batch_sizes = [bs // 4 for bs in dataset_config['batch_sizes'] if bs // 4 >= 4]
+            params['batch_size'] = trial.suggest_categorical('batch_size', transformer_batch_sizes or [8, 16])
             params['fraction_layers_to_finetune'] = trial.suggest_float('fraction_layers_to_finetune', 0.1, 1.0)
-            params['epochs'] = trial.suggest_int('epochs', 2, 8)
-            params['token_length'] = trial.suggest_int('token_length', 128, 512)
+            params['epochs'] = trial.suggest_int('epochs', 
+                max(2, dataset_config['epochs_range'][0] - 1), 
+                min(8, dataset_config['epochs_range'][1]))
+            params['token_length'] = trial.suggest_int('token_length', *dataset_config['token_length_range'])
+            
+            # Add transformer model selection
+            params['transformer_model'] = trial.suggest_categorical('transformer_model', [
+                'distilbert-base-uncased',
+                'roberta-base',
+                'albert-base-v2',
+                'microsoft/deberta-v3-small',  # Efficient DeBERTa variant
+            ])
+            
+            # Adapter configuration
+            params['use_adapters'] = trial.suggest_categorical('use_adapters', [False, True])
+            if params['use_adapters']:
+                params['adapter_reduction_factor'] = trial.suggest_categorical('adapter_reduction_factor', [8, 16, 32, 64])
             
         return params
 
@@ -560,6 +925,11 @@ class TextAutoML:
             fraction_layers_to_finetune=params.get('fraction_layers_to_finetune', self.fraction_layers_to_finetune),
             logistic_C=params.get('logistic_C', self.logistic_C),
             logistic_max_iter=params.get('logistic_max_iter', self.logistic_max_iter),
+            dataset_name=self.dataset_name,
+            use_preprocessing=self.use_preprocessing,
+            transformer_model=params.get('transformer_model', self.transformer_model),
+            use_adapters=params.get('use_adapters', self.use_adapters),
+            adapter_reduction_factor=params.get('adapter_reduction_factor', self.adapter_reduction_factor),
         )
         
         # Create temporary DataFrames
@@ -584,6 +954,21 @@ class TextAutoML:
             else:
                 val_error = temp_automl.fit(train_df, val_df, self.num_classes)
                 
+            # Update HPO progress
+            if hasattr(self, 'hpo_progress'):
+                # Get key params for display
+                key_params = {}
+                if 'lr' in params:
+                    key_params['lr'] = params['lr']
+                if 'batch_size' in params:
+                    key_params['batch_size'] = params['batch_size']
+                if 'ffnn_hidden' in params:
+                    key_params['hidden'] = params['ffnn_hidden']
+                if 'epochs' in params:
+                    key_params['epochs'] = params['epochs']
+                    
+                self.hpo_progress.update_trial(trial.number, val_error, key_params)
+            
             logger.info(f"Trial {trial.number}: val_error = {val_error:.4f}")
             return val_error
         except optuna.exceptions.TrialPruned:
@@ -639,6 +1024,9 @@ class TextAutoML:
         # Create study with persistent storage
         study_name = f"hpo_{self.approach}_{self.seed}"
         if save_path is not None:
+            # Ensure directory exists before creating database
+            save_path = Path(save_path) if not isinstance(save_path, Path) else save_path
+            save_path.mkdir(parents=True, exist_ok=True)
             # Use SQLite database for persistence
             storage_url = f"sqlite:///{save_path}/optuna_study.db"
             try:
@@ -674,10 +1062,16 @@ class TextAutoML:
             else:
                 logger.info("Created in-memory study without pruning")
             
+        # Initialize HPO progress tracker
+        hpo_progress = HPOProgress(n_trials, sampler_name)
+        
         if self.use_multi_fidelity:
             logger.info(f"Starting multi-fidelity HPO for {self.approach} with {n_trials} trials (timeout: {timeout}s)")
         else:
             logger.info(f"Starting standard HPO for {self.approach} with {n_trials} trials (timeout: {timeout}s)")
+        
+        # Store progress tracker for callback
+        self.hpo_progress = hpo_progress
         
         study.optimize(
             lambda trial: self._hpo_objective(trial, save_path=save_path),
@@ -685,6 +1079,10 @@ class TextAutoML:
             timeout=timeout,
             show_progress_bar=True
         )
+        
+        # Finish HPO progress
+        if hasattr(self, 'hpo_progress'):
+            self.hpo_progress.finish()
         
         best_params = study.best_params
         if self.use_multi_fidelity:
@@ -734,6 +1132,13 @@ class TextAutoML:
         self.train_labels = train_df['label'].tolist()
         self.val_texts = val_df['text'].tolist()
         self.val_labels = val_df['label'].tolist()
+        
+        # Apply preprocessing if enabled
+        if self.preprocessor:
+            logger.info("Applying text preprocessing for HPO...")
+            self.train_texts = self.preprocessor.preprocess_batch(self.train_texts)
+            self.val_texts = self.preprocessor.preprocess_batch(self.val_texts)
+            
         self.num_classes = num_classes
         
         # Run HPO (with or without multi-fidelity)
@@ -793,6 +1198,13 @@ class TextAutoML:
         self.train_labels = train_df['label'].tolist()
         self.val_texts = val_df['text'].tolist()
         self.val_labels = val_df['label'].tolist()
+        
+        # Apply preprocessing if enabled
+        if self.preprocessor:
+            logger.info("Applying text preprocessing for NAS...")
+            self.train_texts = self.preprocessor.preprocess_batch(self.train_texts)
+            self.val_texts = self.preprocessor.preprocess_batch(self.val_texts)
+            
         self.num_classes = num_classes
         
         # Run NAS
@@ -866,6 +1278,9 @@ class TextAutoML:
         # Create study with persistent storage
         study_name = f"nas_{self.approach}_{self.seed}"
         if save_path is not None:
+            # Ensure directory exists before creating database
+            save_path = Path(save_path) if not isinstance(save_path, Path) else save_path
+            save_path.mkdir(parents=True, exist_ok=True)
             # Use SQLite database for persistence
             storage_url = f"sqlite:///{save_path}/optuna_nas_study.db"
             try:
@@ -923,17 +1338,40 @@ class TextAutoML:
     def _setup_nas_model(self, trial, train_df, val_df):
         """Setup NAS model based on trial architecture configuration."""
         if self.approach == 'ffnn':
-            # Setup data processing for FFNN
+            # Setup data processing for FFNN with enhanced TF-IDF
+            dataset_size = len(train_df)
+            adaptive_max_features = min(self.vocab_size, max(5000, dataset_size // 10))
+            
             self.vectorizer = TfidfVectorizer(
-                max_features=self.vocab_size,
+                max_features=adaptive_max_features,
                 lowercase=True,
                 min_df=2,
                 max_df=0.8,
                 sublinear_tf=True,
-                ngram_range=(1, 2),
+                ngram_range=(1, 3),  # Include trigrams
+                analyzer='word',
+                strip_accents='unicode',
+                decode_error='ignore',
+                token_pattern=r'\b\w+\b',
             )
-            X_train = self.vectorizer.fit_transform(train_df['text'].tolist()).toarray()
+            
+            # Character-level TF-IDF
+            self.char_vectorizer = TfidfVectorizer(
+                max_features=min(5000, adaptive_max_features // 2),
+                lowercase=True,
+                analyzer='char',
+                ngram_range=(3, 5),
+                min_df=2,
+                max_df=0.8,
+                sublinear_tf=True,
+            )
+            # Fit both vectorizers and combine features
+            from scipy.sparse import hstack
+            X_train_word = self.vectorizer.fit_transform(train_df['text'].tolist())
+            X_train_char = self.char_vectorizer.fit_transform(train_df['text'].tolist())
+            X_train = hstack([X_train_word, X_train_char]).toarray()
             input_dim = X_train.shape[1]
+            logger.info(f"NAS FFNN combined features: {input_dim} dimensions")
             
             # Generate architecture
             architecture_config = NASSearchSpace.generate_ffnn_architecture(trial, input_dim, self.num_classes)
@@ -1070,6 +1508,13 @@ class TextAutoML:
         self.train_labels = train_df['label'].tolist()
         self.val_texts = val_df['text'].tolist()
         self.val_labels = val_df['label'].tolist()
+        
+        # Apply preprocessing if enabled
+        if self.preprocessor:
+            logger.info("Applying text preprocessing...")
+            self.train_texts = self.preprocessor.preprocess_batch(self.train_texts)
+            self.val_texts = self.preprocessor.preprocess_batch(self.val_texts)
+            
         self.num_classes = num_classes
         
         # Run combined NAS+HPO optimization
@@ -1293,6 +1738,13 @@ class TextAutoML:
         self.train_labels = train_df['label'].tolist()
         self.val_texts = val_df['text'].tolist()
         self.val_labels = val_df['label'].tolist()
+        
+        # Apply preprocessing if enabled
+        if self.preprocessor:
+            logger.info("Applying text preprocessing...")
+            self.train_texts = self.preprocessor.preprocess_batch(self.train_texts)
+            self.val_texts = self.preprocessor.preprocess_batch(self.val_texts)
+            
         self.num_classes = num_classes
         
         # Create search space for approach selection
@@ -1461,5 +1913,238 @@ class TextAutoML:
         else:
             logger.error("NEPS auto-approach selection failed")
             return float('inf')
+    
+    def fit_with_ensemble(
+        self,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        num_classes: int,
+        ensemble_methods: List[str] = ['logistic', 'ffnn', 'lstm'],
+        ensemble_type: str = 'auto',  # 'voting', 'stacking', 'weighted', 'auto'
+        individual_trials: int = 10,  # HPO trials per individual model
+        save_path: Path = None,
+        **kwargs
+    ):
+        """
+        Fit ensemble of multiple models for better performance.
+        
+        Args:
+            train_df: Training data
+            val_df: Validation data
+            num_classes: Number of classes
+            ensemble_methods: List of approaches to include in ensemble
+            ensemble_type: Type of ensemble ('voting', 'stacking', 'weighted', 'auto')
+            individual_trials: HPO trials for each individual model
+            save_path: Path to save ensemble results
+        
+        Returns:
+            Validation error of the ensemble
+        """
+        from automl.ensemble import EnsembleBuilder
+        
+        logger.info(f"Starting ensemble training with methods: {ensemble_methods}")
+        logger.info(f"Ensemble type: {ensemble_type}")
+        
+        # Track individual model results
+        individual_models = []
+        individual_scores = []
+        individual_names = []
+        
+        # Train each individual model with HPO
+        for approach in ensemble_methods:
+            logger.info(f"Training individual model: {approach}")
+            
+            # Create a new instance for this approach
+            individual_automl = TextAutoML(
+                seed=self.seed,
+                approach=approach,
+                vocab_size=self.vocab_size,
+                token_length=self.token_length,
+                epochs=self.epochs,
+                batch_size=self.batch_size,
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+                ffnn_hidden=self.ffnn_hidden,
+                use_enhanced_ffnn=self.use_enhanced_ffnn,
+                ffnn_num_layers=self.ffnn_num_layers,
+                ffnn_dropout_rate=self.ffnn_dropout_rate,
+                ffnn_use_residual=self.ffnn_use_residual,
+                ffnn_use_layer_norm=self.ffnn_use_layer_norm,
+                lstm_emb_dim=self.lstm_emb_dim,
+                lstm_hidden_dim=self.lstm_hidden_dim,
+                hpo_sampler=self.hpo_sampler,
+                hpo_pruner=self.hpo_pruner,
+                use_multi_fidelity=self.use_multi_fidelity,
+                dataset_name=self.dataset_name,
+                use_preprocessing=self.use_preprocessing,
+            )
+            
+            try:
+                # Train with HPO for better individual performance
+                if individual_trials > 0:
+                    val_error = individual_automl.fit_with_hpo(
+                        train_df, val_df, num_classes,
+                        n_trials=individual_trials,
+                        timeout=1800  # 30 minutes per model
+                    )
+                else:
+                    val_error = individual_automl.fit(
+                        train_df, val_df, num_classes
+                    )
+                
+                # Store the trained model
+                individual_models.append(individual_automl)
+                individual_scores.append(1 - val_error)  # Convert error to accuracy
+                individual_names.append(approach)
+                
+                logger.info(f"{approach} trained successfully. Validation accuracy: {1-val_error:.4f}")
+                
+            except Exception as e:
+                logger.error(f"Failed to train {approach}: {e}")
+                continue
+        
+        if len(individual_models) < 2:
+            raise ValueError(f"Need at least 2 successful models for ensemble. Got {len(individual_models)}")
+        
+        # Build ensemble using EnsembleBuilder
+        logger.info("Building ensemble...")
+        builder = EnsembleBuilder()
+        
+        for model, name, score in zip(individual_models, individual_names, individual_scores):
+            builder.add_model(model, name, score)
+        
+        # Prepare validation data for ensemble fitting
+        val_texts = val_df['text'].tolist()
+        val_labels = val_df['label'].values
+        
+        # Create ensemble based on specified type
+        if ensemble_type == 'voting':
+            self.ensemble = builder.build_voting_ensemble(voting='soft')
+        elif ensemble_type == 'stacking':
+            self.ensemble = builder.build_stacking_ensemble()
+            # For stacking, we need to fit it properly
+            X_val_combined = self._prepare_ensemble_features(val_texts, individual_models)
+            self.ensemble.fit(X_val_combined, val_labels)
+        elif ensemble_type == 'weighted':
+            self.ensemble = builder.build_weighted_ensemble(weight_method='accuracy')
+            self.ensemble.fit()  # Uses stored validation scores
+        elif ensemble_type == 'auto':
+            # Automatically select best ensemble method
+            X_val_combined = self._prepare_ensemble_features(val_texts, individual_models)
+            self.ensemble, ensemble_name, ensemble_score = builder.auto_select_best_ensemble(
+                X_val_combined, val_labels
+            )
+            logger.info(f"Auto-selected ensemble: {ensemble_name} (score: {ensemble_score:.4f})")
+        else:
+            raise ValueError(f"Unknown ensemble type: {ensemble_type}")
+        
+        # Store ensemble information
+        self.individual_models = individual_models
+        self.ensemble_type = ensemble_type
+        self.approach = 'ensemble'  # Mark as ensemble approach
+        
+        # Evaluate ensemble on validation data
+        val_predictions = self.predict_ensemble(val_df)
+        from sklearn.metrics import accuracy_score
+        ensemble_accuracy = accuracy_score(val_labels, val_predictions)
+        ensemble_error = 1 - ensemble_accuracy
+        
+        logger.info(f"Ensemble validation accuracy: {ensemble_accuracy:.4f}")
+        logger.info(f"Individual model accuracies: {dict(zip(individual_names, individual_scores))}")
+        
+        # Save ensemble results if path provided
+        if save_path:
+            save_path = Path(save_path)
+            save_path.mkdir(parents=True, exist_ok=True)
+            
+            # Save ensemble summary
+            ensemble_summary = {
+                'ensemble_type': ensemble_type,
+                'individual_methods': individual_names,
+                'individual_scores': individual_scores,
+                'ensemble_accuracy': float(ensemble_accuracy),
+                'ensemble_error': float(ensemble_error),
+                'improvement_over_best': float(ensemble_accuracy - max(individual_scores)),
+                'individual_trials': individual_trials,
+            }
+            
+            with open(save_path / "ensemble_summary.yaml", 'w') as f:
+                yaml.dump(ensemble_summary, f, default_flow_style=False)
+                
+            logger.info(f"Ensemble summary saved to {save_path / 'ensemble_summary.yaml'}")
+        
+        return ensemble_error
+    
+    def predict_ensemble(self, test_data: pd.DataFrame) -> np.ndarray:
+        """Make predictions using the trained ensemble."""
+        if not hasattr(self, 'ensemble'):
+            raise ValueError("No ensemble has been trained. Call fit_with_ensemble first.")
+        
+        test_texts = test_data['text'].tolist()
+        
+        # Prepare features for ensemble prediction
+        X_test_combined = self._prepare_ensemble_features(test_texts, self.individual_models)
+        
+        # Make ensemble prediction
+        return self.ensemble.predict(X_test_combined)
+    
+    def _prepare_ensemble_features(self, texts: List[str], models: List) -> np.ndarray:
+        """
+        Prepare features for ensemble by getting predictions from individual models.
+        
+        This creates a feature matrix where each column represents predictions from one model.
+        """
+        predictions_list = []
+        
+        for model in models:
+            # Create a temporary dataframe for prediction
+            temp_df = pd.DataFrame({'text': texts, 'label': [0] * len(texts)})
+            
+            try:
+                if model.approach == 'logistic':
+                    # For logistic regression, get decision function scores
+                    if model.preprocessor:
+                        processed_texts = model.preprocessor.preprocess_batch(texts)
+                    else:
+                        processed_texts = texts
+                    
+                    X_word = model.vectorizer.transform(processed_texts)
+                    if hasattr(model, 'char_vectorizer'):
+                        X_char = model.char_vectorizer.transform(processed_texts)
+                        from scipy.sparse import hstack
+                        X = hstack([X_word, X_char])
+                    else:
+                        X = X_word
+                    
+                    if hasattr(model.model, 'decision_function'):
+                        scores = model.model.decision_function(X)
+                        if scores.ndim == 1:
+                            predictions_list.append(scores)
+                        else:
+                            predictions_list.append(np.max(scores, axis=1))
+                    elif hasattr(model.model, 'predict_proba'):
+                        proba = model.model.predict_proba(X)
+                        predictions_list.append(np.max(proba, axis=1))
+                    else:
+                        pred = model.model.predict(X)
+                        predictions_list.append(pred.astype(float))
+                        
+                elif model.approach in ['ffnn', 'lstm', 'transformer']:
+                    # For neural models, get raw predictions using DataFrame
+                    preds, _ = model.predict(temp_df)
+                    predictions_list.append(preds.astype(float))
+                    
+                else:
+                    # Fallback: use predict method with DataFrame
+                    preds, _ = model.predict(temp_df)
+                    predictions_list.append(preds.astype(float))
+                    
+            except Exception as e:
+                logger.warning(f"Failed to get predictions from {model.approach}: {e}")
+                # Use dummy predictions as fallback
+                predictions_list.append(np.zeros(len(texts)))
+        
+        # Stack predictions as features
+        return np.column_stack(predictions_list)
 
 # end of file

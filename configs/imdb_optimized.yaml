@@ -1,0 +1,100 @@
+# Optimized Configuration for IMDB Movie Reviews Dataset
+# Binary sentiment classification (25k samples), avg length: 1300 chars
+# Target accuracy: >87%
+
+experiment_name: "imdb_optimized"
+description: "Optimized configuration for IMDB movie reviews dataset"
+
+# Global settings optimized for IMDB
+global_settings:
+  seed: 42
+  data_path: null  # override with --data-path argument
+  dataset: imdb
+  
+  # Text processing - keep context for sentiment
+  use_preprocessing: true
+  
+  # General hyperparameters
+  vocab_size: 25000  # Larger vocabulary for rich reviews
+  token_length: 512  # Longer sequences for detailed reviews
+  epochs: 10
+  batch_size: 32  # Smaller due to longer sequences
+  lr: 0.0002
+  weight_decay: 0.01
+  
+  # Model-specific defaults
+  ffnn_hidden: 512  # Larger for complex patterns
+  lstm_emb_dim: 256
+  lstm_hidden_dim: 256
+  
+  # Transformer settings
+  transformer_model: "roberta-base"  # Better for longer texts
+  fraction_layers_to_finetune: 0.4
+  use_adapters: true  # Efficient fine-tuning
+  adapter_reduction_factor: 16
+  
+  # Optimization settings
+  use_hpo: true
+  hpo_trials: 75  # More trials for binary classification
+  hpo_sampler: "tpe"
+  hpo_pruner: "successive_halving"
+  use_multi_fidelity: true
+
+# Best approaches for IMDB (long sentiment analysis)
+recommended_approaches:
+  primary: transformer  # Best for nuanced sentiment
+  alternatives:
+    - lstm  # Good for sequential patterns
+    - ffnn  # Surprisingly effective with good features
+
+# Approach-specific optimizations
+approach_specific:
+  ffnn:
+    ffnn_hidden: 512
+    vocab_size: 30000  # Rich vocabulary
+    
+  lstm:
+    lstm_emb_dim: 256
+    lstm_hidden_dim: 256
+    batch_size: 16  # Very small batches
+    token_length: 512
+    epochs: 12
+    
+  logistic:
+    logistic_C: 0.5
+    logistic_max_iter: 2000
+    vocab_size: 30000
+    
+  transformer:
+    transformer_model: "roberta-base"
+    batch_size: 8  # Small batches for long sequences
+    lr: 1e-5
+    epochs: 4
+    fraction_layers_to_finetune: 0.4
+    use_adapters: true
+
+# HPO search space overrides
+hpo_overrides:
+  ffnn:
+    lr: [5e-5, 5e-3]
+    ffnn_hidden: [256, 1024]
+    vocab_size: [20000, 40000]
+    
+  lstm:
+    lr: [5e-5, 5e-3]
+    lstm_emb_dim: [128, 512]
+    lstm_hidden_dim: [128, 512]
+    token_length: [256, 768]
+    
+  transformer:
+    lr: [5e-7, 3e-5]
+    fraction_layers_to_finetune: [0.2, 0.6]
+    batch_size: [4, 8, 16]
+    transformer_model: ["roberta-base", "albert-base-v2", "distilbert-base-uncased"]
+
+# Output settings
+output:
+  base_path: "results/imdb_optimized"
+  save_predictions: true
+  save_scores: true
+  create_summary: true

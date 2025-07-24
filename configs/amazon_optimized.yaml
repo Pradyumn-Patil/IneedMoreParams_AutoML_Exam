@@ -1,0 +1,95 @@
+# Optimized Configuration for Amazon Product Reviews Dataset
+# 3-class product reviews (25k samples), avg length: 512 chars
+# Target accuracy: >82%
+
+experiment_name: "amazon_optimized"
+description: "Optimized configuration for Amazon product reviews dataset"
+
+# Global settings optimized for Amazon
+global_settings:
+  seed: 42
+  data_path: null  # override with --data-path argument
+  dataset: amazon
+  
+  # Text processing
+  use_preprocessing: true
+  
+  # General hyperparameters
+  vocab_size: 12000  # Medium vocabulary for product reviews
+  token_length: 256  # Medium sequences
+  epochs: 8
+  batch_size: 64
+  lr: 0.0003
+  weight_decay: 0.01
+  
+  # Model-specific defaults
+  ffnn_hidden: 256
+  lstm_emb_dim: 128
+  lstm_hidden_dim: 128
+  
+  # Transformer settings
+  transformer_model: "distilbert-base-uncased"
+  fraction_layers_to_finetune: 0.3
+  use_adapters: false
+  
+  # Optimization settings
+  use_hpo: true
+  hpo_trials: 50
+  hpo_sampler: "tpe"
+  hpo_pruner: "median"
+  use_multi_fidelity: true
+
+# Best approaches for Amazon (sentiment analysis)
+recommended_approaches:
+  primary: transformer  # Best for sentiment nuances
+  alternatives:
+    - lstm  # Good for sequential sentiment
+    - ffnn  # Fast baseline with TF-IDF
+
+# Approach-specific optimizations
+approach_specific:
+  ffnn:
+    ffnn_hidden: 256
+    vocab_size: 15000  # Larger vocab for TF-IDF
+    
+  lstm:
+    lstm_emb_dim: 128
+    lstm_hidden_dim: 128
+    batch_size: 32  # Smaller batches for LSTM
+    token_length: 256
+    
+  logistic:
+    logistic_C: 1.0
+    logistic_max_iter: 1500
+    vocab_size: 15000
+    
+  transformer:
+    transformer_model: "distilbert-base-uncased"  # Good balance of speed/accuracy
+    batch_size: 16
+    lr: 2e-5
+    epochs: 5
+    fraction_layers_to_finetune: 0.3
+
+# HPO search space overrides
+hpo_overrides:
+  ffnn:
+    lr: [1e-4, 1e-2]
+    ffnn_hidden: [128, 512]
+    vocab_size: [10000, 20000]
+    
+  lstm:
+    lr: [1e-4, 1e-2]
+    lstm_emb_dim: [64, 256]
+    lstm_hidden_dim: [64, 256]
+    
+  transformer:
+    lr: [1e-6, 5e-5]
+    fraction_layers_to_finetune: [0.1, 0.5]
+    batch_size: [8, 16, 32]
+
+# Output settings
+output:
+  base_path: "results/amazon_optimized"
+  save_predictions: true
+  save_scores: true
+  create_summary: true

@@ -1,0 +1,17 @@
+description: Configuration with class weights for amazon
+experiment_name: amazon_weighted
+global_settings:
+  class_weights:
+    0: 3.4343642611683847
+    1: 2.955930198166223
+    2: 0.4218479591406019
+  dataset: amazon
+  evaluation_metric: macro_f1
+  hpo_trials: 30
+  use_hpo: true
+  use_preprocessing: true
+recommended_approaches:
+  alternatives:
+  - logistic
+  - lstm
+  primary: ffnn

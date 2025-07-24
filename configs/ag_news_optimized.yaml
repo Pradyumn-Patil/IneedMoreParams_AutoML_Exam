@@ -1,0 +1,98 @@
+# Optimized Configuration for AG News Dataset
+# 4-class news categorization (120k samples), avg length: 235 chars
+# Target accuracy: >90%
+
+experiment_name: "ag_news_optimized"
+description: "Optimized configuration for AG News categorization dataset"
+
+# Global settings optimized for AG News
+global_settings:
+  seed: 42
+  data_path: null  # override with --data-path argument
+  dataset: ag_news
+  
+  # Text processing - aggressive for news
+  use_preprocessing: true
+  
+  # General hyperparameters
+  vocab_size: 15000  # Medium vocabulary for news
+  token_length: 192  # Shorter sequences
+  epochs: 6
+  batch_size: 128  # Large batches for large dataset
+  lr: 0.0005
+  weight_decay: 0.02
+  
+  # Model-specific defaults
+  ffnn_hidden: 256
+  lstm_emb_dim: 128
+  lstm_hidden_dim: 128
+  
+  # Transformer settings
+  transformer_model: "distilbert-base-uncased"  # Fast and effective
+  fraction_layers_to_finetune: 0.25
+  use_adapters: false
+  
+  # Optimization settings
+  use_hpo: true
+  hpo_trials: 60
+  hpo_sampler: "tpe"
+  hpo_pruner: "hyperband"  # Efficient for large dataset
+  use_multi_fidelity: true
+
+# Best approaches for AG News (topic classification)
+recommended_approaches:
+  primary: ffnn  # Fast and effective for topic classification
+  alternatives:
+    - transformer  # High accuracy but slower
+    - logistic  # Surprisingly good baseline
+
+# Approach-specific optimizations
+approach_specific:
+  ffnn:
+    ffnn_hidden: 384
+    vocab_size: 20000
+    batch_size: 256
+    
+  lstm:
+    lstm_emb_dim: 128
+    lstm_hidden_dim: 128
+    batch_size: 64
+    token_length: 192
+    
+  logistic:
+    logistic_C: 10.0  # Less regularization
+    logistic_max_iter: 1000
+    vocab_size: 20000
+    
+  transformer:
+    transformer_model: "distilbert-base-uncased"
+    batch_size: 32
+    lr: 3e-5
+    epochs: 3  # Quick convergence
+    fraction_layers_to_finetune: 0.2
+
+# HPO search space overrides
+hpo_overrides:
+  ffnn:
+    lr: [1e-4, 1e-2]
+    ffnn_hidden: [128, 512]
+    vocab_size: [10000, 25000]
+    batch_size: [64, 128, 256]
+    
+  lstm:
+    lr: [1e-4, 1e-2]
+    lstm_emb_dim: [64, 256]
+    lstm_hidden_dim: [64, 256]
+    
+  transformer:
+    lr: [1e-6, 1e-4]
+    fraction_layers_to_finetune: [0.1, 0.4]
+    batch_size: [16, 32, 64]
+    epochs: [2, 5]
+
+# Output settings
+output:
+  base_path: "results/ag_news_optimized"
+  save_predictions: true
+  save_scores: true
+  create_summary: true

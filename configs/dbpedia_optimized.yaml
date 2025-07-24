@@ -1,0 +1,104 @@
+# Optimized Configuration for DBpedia Dataset
+# 14-class ontology classification (560k samples), avg length: 300 chars
+# Target accuracy: >98%
+
+experiment_name: "dbpedia_optimized"
+description: "Optimized configuration for DBpedia ontology classification dataset"
+
+# Global settings optimized for DBpedia
+global_settings:
+  seed: 42
+  data_path: null  # override with --data-path argument
+  dataset: dbpedia
+  
+  # Text processing - preserve structure
+  use_preprocessing: true
+  
+  # General hyperparameters
+  vocab_size: 30000  # Large vocabulary for diverse topics
+  token_length: 256  # Medium sequences
+  epochs: 4  # Quick convergence on large dataset
+  batch_size: 256  # Very large batches
+  lr: 0.001
+  weight_decay: 0.01
+  
+  # Model-specific defaults
+  ffnn_hidden: 512
+  lstm_emb_dim: 256
+  lstm_hidden_dim: 256
+  
+  # Transformer settings
+  transformer_model: "albert-base-v2"  # Efficient for large dataset
+  fraction_layers_to_finetune: 0.2
+  use_adapters: true
+  adapter_reduction_factor: 32
+  
+  # Optimization settings
+  use_hpo: true
+  hpo_trials: 40  # Fewer trials needed due to dataset size
+  hpo_sampler: "random"  # Works well for large datasets
+  hpo_pruner: "hyperband"
+  use_multi_fidelity: true
+
+# Best approaches for DBpedia (14-class classification)
+recommended_approaches:
+  primary: ffnn  # Excellent for structured classification
+  alternatives:
+    - transformer  # Highest accuracy potential
+    - logistic  # Fast and effective baseline
+
+# Approach-specific optimizations
+approach_specific:
+  ffnn:
+    ffnn_hidden: 768  # Larger for 14 classes
+    vocab_size: 40000  # Rich vocabulary
+    batch_size: 512
+    epochs: 3
+    
+  lstm:
+    lstm_emb_dim: 256
+    lstm_hidden_dim: 256
+    batch_size: 128
+    token_length: 256
+    epochs: 4
+    
+  logistic:
+    logistic_C: 5.0
+    logistic_max_iter: 800  # Quick convergence
+    vocab_size: 40000
+    
+  transformer:
+    transformer_model: "albert-base-v2"  # Memory efficient
+    batch_size: 64
+    lr: 5e-5
+    epochs: 2  # Very quick convergence
+    fraction_layers_to_finetune: 0.15
+    use_adapters: true
+
+# HPO search space overrides
+hpo_overrides:
+  ffnn:
+    lr: [5e-4, 5e-2]
+    ffnn_hidden: [256, 1024]
+    vocab_size: [20000, 50000]
+    batch_size: [128, 256, 512]
+    
+  lstm:
+    lr: [1e-4, 1e-2]
+    lstm_emb_dim: [128, 512]
+    lstm_hidden_dim: [128, 512]
+    batch_size: [64, 128, 256]
+    
+  transformer:
+    lr: [1e-6, 1e-4]
+    fraction_layers_to_finetune: [0.1, 0.3]
+    batch_size: [32, 64, 128]
+    epochs: [1, 3]
+    transformer_model: ["albert-base-v2", "distilbert-base-uncased"]
+
+# Output settings
+output:
+  base_path: "results/dbpedia_optimized"
+  save_predictions: true
+  save_scores: true
+  create_summary: true

@@ -1,0 +1,26 @@
+# AutoML Text Classification Requirements
+# Generated from pyproject.toml
+
+# Core dependencies
+numpy>=1.0,<2.0
+scikit-learn>=1.3
+transformers>=4.20
+torch>=1.9.0  # Required by transformers
+datasets>=2.0
+optuna>=3.0
+neural-pipeline-search==0.13.0
+
+# Utilities
+pyyaml>=6.0
+toml>=0.10.2
+pyarrow>=12.0
+ipython>=8.0
+
+# Additional dependencies for improvements
+nltk>=3.8  # For text preprocessing
+scipy>=1.9  # For sparse matrix operations
+tqdm>=4.60  # For progress bars
+pandas>=1.3  # For data handling
+
+# Optional: Transformers adapters (if available)
+# adapter-transformers>=3.0  # Uncomment if using adapters

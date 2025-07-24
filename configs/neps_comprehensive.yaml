@@ -1,0 +1,113 @@
+# Comprehensive NEPS Auto-Approach Configuration
+# Let NEPS automatically select the best approach and optimization strategy
+
+experiment_name: "neps_comprehensive"
+description: "NEPS automatic approach selection for all datasets"
+
+# Global settings for NEPS
+global_settings:
+  seed: 42
+  data_path: null  # override with --data-path argument
+  
+  # Enable text preprocessing
+  use_preprocessing: true
+  
+  # NEPS-specific settings
+  use_neps_auto_approach: true
+  neps_max_evaluations: 32  # Balanced budget
+  neps_timeout: 14400  # 4 hours per dataset
+  neps_searcher: "bayesian_optimization"  # Best searcher
+  
+  # These will be overridden by NEPS but set reasonable defaults
+  vocab_size: 15000
+  token_length: 256
+  epochs: 5
+  batch_size: 64
+  lr: 0.0001
+  weight_decay: 0.01
+
+# Run NEPS on all datasets
+experiments:
+  datasets:
+    - amazon
+    - imdb
+    - ag_news
+    - dbpedia
+
+# Dataset-specific NEPS configurations
+dataset_specific:
+  amazon:
+    neps_max_evaluations: 24  # Fewer evaluations for smaller dataset
+    neps_timeout: 10800  # 3 hours
+    
+  imdb:
+    neps_max_evaluations: 32  # More evaluations for binary classification
+    neps_timeout: 14400  # 4 hours
+    
+  ag_news:
+    neps_max_evaluations: 28  # Balanced
+    neps_timeout: 10800  # 3 hours
+    
+  dbpedia:
+    neps_max_evaluations: 20  # Fewer due to large dataset size
+    neps_timeout: 7200  # 2 hours
+
+# NEPS will explore these approach options
+neps_approach_space:
+  approaches:
+    - logistic
+    - ffnn
+    - lstm
+    - transformer
+    
+  optimization_strategies:
+    - basic  # Standard training
+    - hpo    # Hyperparameter optimization only
+    - nas    # Neural architecture search only
+    - nas_hpo  # Combined NAS+HPO
+    
+  multi_fidelity_options:
+    - true
+    - false
+    
+  hpo_samplers:
+    - tpe
+    - random
+    - cmaes
+    
+  hpo_pruners:
+    - median
+    - successive_halving
+    - hyperband
+
+# Extended budget configuration for best results
+extended_budget:
+  amazon:
+    neps_max_evaluations: 48
+    neps_timeout: 21600  # 6 hours
+    
+  imdb:
+    neps_max_evaluations: 64
+    neps_timeout: 28800  # 8 hours
+    
+  ag_news:
+    neps_max_evaluations: 56
+    neps_timeout: 21600  # 6 hours
+    
+  dbpedia:
+    neps_max_evaluations: 40
+    neps_timeout: 14400  # 4 hours
+
+# Quick test configuration
+quick_test:
+  neps_max_evaluations: 8
+  neps_timeout: 3600  # 1 hour
+  neps_searcher: "random_search"  # Faster for testing
+
+# Output settings
+output:
+  base_path: "results/neps_comprehensive"
+  save_predictions: true
+  save_scores: true
+  create_summary: true
+  save_neps_history: true  # Save NEPS optimization history

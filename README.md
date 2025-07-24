@@ -1,9 +1,19 @@
 # AutoML Exam - SS25 (Text Data)
 
-This repo serves as a template for the exam assignment of the AutoML SS25 course
-at the university of Freiburg.
+This repository contains a comprehensive AutoML system for text classification developed for the SS25 AutoML course
+at the University of Freiburg. The system automatically selects and optimizes machine learning pipelines 
+for text classification tasks.
 
-The aim of this repo is to provide a minimal installable template to help you get up and running.
+## Features
+
+- **Multiple Approaches**: Logistic Regression, Feed-Forward Neural Networks, LSTM, CNN-LSTM Hybrid, Transformer models
+- **Advanced Text Processing**: Enhanced TF-IDF with trigrams and character n-grams, advanced preprocessing
+- **Hyperparameter Optimization**: Multi-fidelity HPO with Optuna (TPE, Random, CMA-ES samplers)
+- **Neural Architecture Search**: Automated architecture selection for neural models
+- **Text Augmentation**: Synonym replacement, random insertion/deletion/swap
+- **Meta-Learning**: Dataset similarity analysis for configuration warm-starting
+- **Ensemble Methods**: Voting, stacking, and weighted averaging
+- **One-Click Solution**: Fully automated pipeline with intelligent resource allocation
 
 ## Installation
 
@@ -48,19 +58,40 @@ We make no restrictions on the python library or version you use, but we recomme
 
 ## Code
 
-We provide the following:
+The system provides multiple entry points for different use cases:
 
-* `run.py`: A script that trains an _AutoML-System_ on the training split of a given dataset and 
-  then generates predictions for the test split, saving those predictions to a file. 
-  For the training datasets, the test splits will contain the ground truth labels, but for the 
-  test dataset which we provide later the labels of the test split will not be available. 
-  You will be expected to generate these labels yourself and submit them to us through GitHub classrooms.
+### Main Scripts
 
-* `automl`: This is a python package that will be installed above and contain your source code for whatever
-  system you would like to build. We have provided a dummy `AutoML` class to serve as an example.
+* `run_automl_complete.py`: **One-click complete AutoML solution** that automatically selects the best approach, allocates budget, and runs the full pipeline
+* `run.py`: Basic training script with manual configuration options
+* `run_with_config.py`: Run experiments using YAML configuration files
+* `run_all_experiments.py`: Batch runner for all datasets with optimized settings
 
-*You are completely free to modify, install new libraries, make changes and in general do whatever you want with the code.* 
-The *only requirement* for the exam will be that you can generate predictions for the test splits of our datasets in a `.npy` file that we can then use to give you a test score through GitHub classrooms.
+### Core Package Structure
+
+* `automl/core.py`: Main TextAutoML class orchestrating the entire pipeline
+* `automl/models.py`: Neural network architectures (FFNN, LSTM, CNN-LSTM, NAS-searchable models)
+* `automl/datasets.py`: Dataset loaders for all supported text classification datasets
+* `automl/preprocessing.py`: Advanced text preprocessing with dataset-specific strategies
+* `automl/augmentation.py`: Text augmentation techniques for improving model robustness
+* `automl/ensemble.py`: Ensemble methods for combining multiple models
+* `automl/meta_learning.py`: Meta-learning for dataset similarity and warm-starting
+
+### Quick Start Examples
+
+```bash
+# One-click solution with 24-hour budget
+python run_automl_complete.py --dataset amazon --data-path ./data --budget 24
+
+# Quick test with 1-hour budget
+python run_automl_complete.py --dataset amazon --data-path ./data --quick-test
+
+# Basic training with specific approach
+python run.py --data-path ./data --dataset amazon --approach logistic --epochs 5
+
+# With hyperparameter optimization
+python run.py --data-path ./data --dataset amazon --use-hpo --hpo-trials 50
+```
 
 
 ## Data
@@ -101,6 +132,19 @@ The following table will provide you an overview of their characteristics and al
 | *final\_exam\_dataset* | TBA | TBA | TBA | TBA | TBA | TBA | TBA |
 
 *NOTE*: sequence length calculated at the raw character level
+
+## Performance Results
+
+Our AutoML system achieves the following test accuracies:
+
+| Dataset | Baseline | Our Result | Improvement |
+|---------|----------|------------|-------------|
+| Amazon  | 81.799%  | 83.58%     | +1.78%      |
+| IMDB    | 86.993%  | 84.89%     | -2.10%      |
+| AG News | 90.265%  | 87.38%     | -2.89%      |
+| DBpedia | 97.882%  | 95.50%     | -2.38%      |
+
+*Note: Results obtained with limited computational resources. Full 24-hour budget expected to improve performance.*
 
 We will add the test dataset later in the final Github Classroom template code that will be released.
  <!-- by pushing its class definition to the `datasets.py` file.  -->
