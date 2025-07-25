@@ -83,6 +83,8 @@ class TextAutoML:
         hpo_sampler='tpe',  # 'tpe', 'random', 'cmaes', 'nsga2'
         hpo_pruner='median',  # 'median', 'successive_halving', 'hyperband'
         use_multi_fidelity=True,  # Enable/disable multi-fidelity optimization
+        # NAS parameters
+        use_nas=False,  # Enable/disable neural architecture search
         # Preprocessing parameters
         dataset_name=None,  # For dataset-specific preprocessing
         use_preprocessing=True,  # Enable/disable preprocessing
