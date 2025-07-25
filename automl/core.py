@@ -1239,6 +1239,7 @@ class TextAutoML:
         # Create temporary AutoML instance with current hyperparameters (no HPO)
         temp_automl = TextAutoML(
             seed=self.seed,
+            dataset_name=self.dataset_name,
             approach=self.approach,
             vocab_size=self.vocab_size,
             token_length=self.token_length,
@@ -1253,6 +1254,8 @@ class TextAutoML:
         )
         
         try:
+
+            temp_automl.num_classes = self.num_classes
             # Generate architecture for this trial
             temp_automl._setup_nas_model(trial, train_df, val_df)
             
@@ -1321,7 +1324,7 @@ class TextAutoML:
             'text': self.val_texts,
             'label': self.val_labels
         })
-        
+
         study.optimize(
             lambda trial: self._nas_objective(trial, train_df, val_df, save_path=save_path),
             n_trials=n_trials,
@@ -1408,6 +1411,7 @@ class TextAutoML:
         temp_automl = TextAutoML(
             seed=self.seed,
             approach=self.approach,
+            dataset_name=self.dataset_name, 
             vocab_size=hpo_params.get('vocab_size', self.vocab_size),
             token_length=hpo_params.get('token_length', self.token_length),
             epochs=hpo_params.get('epochs', self.epochs),
@@ -1420,6 +1424,7 @@ class TextAutoML:
             fraction_layers_to_finetune=hpo_params.get('fraction_layers_to_finetune', self.fraction_layers_to_finetune),
             logistic_C=hpo_params.get('logistic_C', self.logistic_C),
             logistic_max_iter=hpo_params.get('logistic_max_iter', self.logistic_max_iter),
+            use_nas=True,  # Enable NAS for this trial        
         )
         
         # Create temporary DataFrames
@@ -1583,6 +1588,7 @@ class TextAutoML:
             temp_automl = TextAutoML(
                 seed=self.seed,
                 approach=approach,
+                dataset_name=self.dataset_name, 
                 vocab_size=self.vocab_size,
                 token_length=self.token_length,
                 epochs=self.epochs,
