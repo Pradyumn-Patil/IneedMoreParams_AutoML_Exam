@@ -18,6 +18,7 @@ from typing import Tuple, List
 from collections import Counter
 import yaml
 from tqdm import tqdm
+import os
 
 try:
     import optuna
@@ -53,6 +54,39 @@ try:
     NEPS_AVAILABLE = True
 except ImportError:
     NEPS_AVAILABLE = False
+
+def setup_logging(log_file='run.log', level=logging.INFO):
+    """Set up logging to both file and console."""
+    # Create logs directory if it doesn't exist
+    log_dir = Path(log_file).parent
+    log_dir.mkdir(exist_ok=True)
+    
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    
+    # Clear existing handlers to avoid duplicates
+    root_logger.handlers.clear()
+    
+    # Create formatter
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # File handler
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(level)
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+    
+    return root_logger
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +133,10 @@ class TextAutoML:
         augmentation_factor=0.5,  # Fraction of data to augment
         balance_augmentation=True,  # Augment minority classes more
     ):
+        # Set up logging to file and console
+        setup_logging('run.log', logging.INFO)
+        logger.info("=== TextAutoML Initialized ===")
+        
         self.seed = seed
         np.random.seed(seed)
         torch.manual_seed(seed)
@@ -1715,7 +1753,7 @@ class TextAutoML:
         max_evaluations: int = 16,  # 4 approaches × 4 strategies = 16 combinations
         timeout: int = 7200,  # 2 hours total
         optimizer: str = 'bayesian_optimization',
-        root_directory: str = "./neps_auto_approach",
+        root_directory = os.path.abspath("./neps_auto_approach"),
         save_path: Path = None,
         **kwargs
     ):
@@ -1798,7 +1836,8 @@ class TextAutoML:
         # Run NEPS optimization
         neps.run(
             evaluate_pipeline=self._neps_approach_objective,
-            **neps_config
+            **neps_config,
+            overwrite_working_directory=True,
         )
         
         # Get best result
