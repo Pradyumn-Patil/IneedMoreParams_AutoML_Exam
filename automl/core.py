@@ -55,39 +55,6 @@ try:
 except ImportError:
     NEPS_AVAILABLE = False
 
-def setup_logging(log_file='run.log', level=logging.INFO):
-    """Set up logging to both file and console."""
-    # Create logs directory if it doesn't exist
-    log_dir = Path(log_file).parent
-    log_dir.mkdir(exist_ok=True)
-    
-    # Configure root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(level)
-    
-    # Clear existing handlers to avoid duplicates
-    root_logger.handlers.clear()
-    
-    # Create formatter
-    formatter = logging.Formatter(
-        '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    
-    # File handler
-    file_handler = logging.FileHandler(log_file, mode='w')
-    file_handler.setLevel(level)
-    file_handler.setFormatter(formatter)
-    root_logger.addHandler(file_handler)
-    
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(level)
-    console_handler.setFormatter(formatter)
-    root_logger.addHandler(console_handler)
-    
-    return root_logger
-
 logger = logging.getLogger(__name__)
 
 class TextAutoML:
@@ -133,8 +100,7 @@ class TextAutoML:
         augmentation_factor=0.5,  # Fraction of data to augment
         balance_augmentation=True,  # Augment minority classes more
     ):
-        # Set up logging to file and console
-        setup_logging('run.log', logging.INFO)
+
         logger.info("=== TextAutoML Initialized ===")
         
         self.seed = seed
