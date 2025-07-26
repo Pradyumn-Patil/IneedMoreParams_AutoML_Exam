@@ -201,8 +201,8 @@ def main_loop(
             num_classes=num_classes,
             max_evaluations=neps_max_evaluations,
             timeout=neps_timeout,
-            searcher=neps_searcher,
-            working_directory=str(output_path / "neps_auto_approach"),
+            optimizer=neps_searcher,
+            root_directory=str(output_path / "neps_auto_approach"),
             save_path=output_path,
         )
         

@@ -18,7 +18,6 @@ from typing import Tuple, List
 from collections import Counter
 import yaml
 from tqdm import tqdm
-import os
 
 try:
     import optuna
@@ -1734,7 +1733,7 @@ class TextAutoML:
         max_evaluations: int = 16,  # 4 approaches × 4 strategies = 16 combinations
         timeout: int = 7200,  # 2 hours total
         optimizer: str = 'bayesian_optimization',
-        root_directory = os.path.abspath("./neps_auto_approach"),
+        root_directory = None,  # Will be set properly below
         save_path: Path = None,
         **kwargs
     ):
@@ -1756,9 +1755,14 @@ class TextAutoML:
         if not NEPS_AVAILABLE:
             raise ImportError("NEPS is required for auto-approach selection. Install with: pip install neps")
         
+        # Set default root_directory if not provided
+        if root_directory is None:
+            raise ValueError("root_directory must be specified for NEPS auto-approach selection.")
+        
         logger.info("Starting NEPS automatic approach selection...")
         logger.info("This will use existing Optuna methods (fit_with_hpo, fit_with_nas, fit_with_nas_hpo) internally")
         logger.info(f"Max evaluations: {max_evaluations}, Total timeout: {timeout}s")
+        logger.info(f"NEPS root directory: {root_directory}")
         
         # Store data for optimization
         self.train_texts = train_df['text'].tolist()
