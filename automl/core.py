@@ -1600,27 +1600,82 @@ class TextAutoML:
     # ========== NEPS Auto-Approach Selection Pipeline ==========
     
     def _create_neps_approach_search_space(self):
-        """Create NEPS search space for approach selection."""
+        """Create NEPS search space with exactly 30 hardcoded valid combinations."""
         if not NEPS_AVAILABLE:
             raise ImportError("NEPS is required. Install with: pip install neps")
             
+        # Hardcoded 30 valid combinations to avoid NEPS categorical explosion
+        # Each combination is: (approach, strategy, sampler, pruner)
+        # use_multi_fidelity is always True (as requested)
+        valid_combinations = [
+            # Basic strategy (4 combinations) - no sampler/pruner needed but we include defaults
+            ('logistic', 'basic', 'tpe', 'median'),
+            ('ffnn', 'basic', 'tpe', 'median'), 
+            ('lstm', 'basic', 'tpe', 'median'),
+            ('transformer', 'basic', 'tpe', 'median'),
+            
+            # HPO strategy (16 combinations) - all approaches with all sampler/pruner combinations
+            ('logistic', 'hpo', 'tpe', 'median'),
+            ('logistic', 'hpo', 'tpe', 'hyperband'),
+            ('logistic', 'hpo', 'random', 'median'),
+            ('logistic', 'hpo', 'random', 'hyperband'),
+            ('ffnn', 'hpo', 'tpe', 'median'),
+            ('ffnn', 'hpo', 'tpe', 'hyperband'),
+            ('ffnn', 'hpo', 'random', 'median'),
+            ('ffnn', 'hpo', 'random', 'hyperband'),
+            ('lstm', 'hpo', 'tpe', 'median'),
+            ('lstm', 'hpo', 'tpe', 'hyperband'),
+            ('lstm', 'hpo', 'random', 'median'),
+            ('lstm', 'hpo', 'random', 'hyperband'),
+            ('transformer', 'hpo', 'tpe', 'median'),
+            ('transformer', 'hpo', 'tpe', 'hyperband'),
+            ('transformer', 'hpo', 'random', 'median'),
+            ('transformer', 'hpo', 'random', 'hyperband'),
+            
+            # NAS strategy (2 combinations) - only ffnn and lstm support NAS
+            ('ffnn', 'nas', 'tpe', 'median'),  # sampler/pruner ignored for NAS
+            ('lstm', 'nas', 'tpe', 'median'),
+            
+            # NAS+HPO strategy (8 combinations) - only ffnn and lstm with all sampler/pruner combinations
+            ('ffnn', 'nas_hpo', 'tpe', 'median'),
+            ('ffnn', 'nas_hpo', 'tpe', 'hyperband'),
+            ('ffnn', 'nas_hpo', 'random', 'median'),
+            ('ffnn', 'nas_hpo', 'random', 'hyperband'),
+            ('lstm', 'nas_hpo', 'tpe', 'median'),
+            ('lstm', 'nas_hpo', 'tpe', 'hyperband'),
+            ('lstm', 'nas_hpo', 'random', 'median'),
+            ('lstm', 'nas_hpo', 'random', 'hyperband'),
+        ]
+        
+        # Create a single categorical parameter that indexes into our valid combinations
         search_space = {
-            'approach': neps.Categorical(['logistic', 'ffnn', 'lstm', 'transformer']),
-            'optimization_strategy': neps.Categorical(['basic', 'hpo', 'nas', 'nas_hpo']),
-            'use_multi_fidelity': neps.Categorical([True, False]),
-            'hpo_sampler': neps.Categorical(['tpe', 'random', 'cmaes', 'nsga2']),
-            'hpo_pruner': neps.Categorical(['median', 'successive_halving', 'hyperband']),
+            'combination_index': neps.Categorical(list(range(len(valid_combinations))))
         }
-        logger.info("Created NEPS approach selection search space with multi-fidelity options")
+        
+        # Store valid combinations for later use
+        self._valid_combinations = valid_combinations
+        
+        logger.info(f"Created NEPS hardcoded search space with exactly {len(valid_combinations)} valid combinations")
+        logger.info("Combinations: 4 basic + 16 hpo + 2 nas + 8 nas_hpo = 30 total")
         return search_space
 
-    def _neps_approach_objective(self, approach: str, optimization_strategy: str, use_multi_fidelity: bool, hpo_sampler: str, hpo_pruner: str):
-        """NEPS objective function that uses existing Optuna-based methods."""
+    def _neps_approach_objective(self, combination_index: int):
+        """NEPS objective function using hardcoded valid combinations."""
         try:
             start_time = time.time()
             
-            logger.info(f"NEPS trying approach='{approach}' with strategy='{optimization_strategy}', "
-                       f"multi_fidelity={use_multi_fidelity}, sampler={hpo_sampler}, pruner={hpo_pruner}")
+            # Get the combination from our hardcoded list
+            if not hasattr(self, '_valid_combinations'):
+                # Fallback - recreate combinations if not found
+                self._create_neps_approach_search_space()
+            
+            approach, optimization_strategy, hpo_sampler, hpo_pruner = self._valid_combinations[combination_index]
+            
+            # Always use multi-fidelity as requested
+            use_multi_fidelity = True
+            
+            logger.info(f"NEPS evaluating combination {combination_index}: approach='{approach}', "
+                       f"strategy='{optimization_strategy}', sampler={hpo_sampler}, pruner={hpo_pruner}")
             
             # Create temporary AutoML instance with the suggested approach and settings
             temp_automl = TextAutoML(
@@ -1656,11 +1711,11 @@ class TextAutoML:
             
             # Use existing Optuna-based methods based on optimization strategy
             if optimization_strategy == 'basic':
-                # Just basic training
+                # Just basic training (hpo_sampler and hpo_pruner ignored)
                 val_error = temp_automl.fit(train_df, val_df, self.num_classes)
                 
             elif optimization_strategy == 'hpo':
-                # Use existing HPO method
+                # Use existing HPO method with conditional parameters
                 val_error = temp_automl.fit_with_hpo(
                     train_df, val_df, self.num_classes,
                     n_trials=10,  # Reduced for NEPS efficiency
@@ -1671,79 +1726,39 @@ class TextAutoML:
                 )
                 
             elif optimization_strategy == 'nas':
-                # Use existing NAS method (only for supported approaches)
-                if approach in ['ffnn', 'lstm']:
-                    val_error = temp_automl.fit_with_nas(
-                        train_df, val_df, self.num_classes,
-                        n_trials=8,   # Reduced for NEPS efficiency
-                        timeout=600,  # 10 minutes per approach
-                    )
-                else:
-                    # Fallback to HPO for non-NAS approaches
-                    logger.info(f"NAS not supported for {approach}, falling back to HPO")
-                    val_error = temp_automl.fit_with_hpo(
-                        train_df, val_df, self.num_classes,
-                        n_trials=10,
-                        timeout=600,
-                        sampler=hpo_sampler,
-                        pruner=hpo_pruner,
-                        use_multi_fidelity=use_multi_fidelity,
-                    )
+                # Use existing NAS method (only for ffnn/lstm)
+                val_error = temp_automl.fit_with_nas(
+                    train_df, val_df, self.num_classes,
+                    n_trials=8,   # Reduced for NEPS efficiency
+                    timeout=600,  # 10 minutes per approach
+                )
                     
             elif optimization_strategy == 'nas_hpo':
-                # Use existing combined NAS+HPO method
-                if approach in ['ffnn', 'lstm']:
-                    val_error = temp_automl.fit_with_nas_hpo(
-                        train_df, val_df, self.num_classes,
-                        n_trials=12,  # Reduced for NEPS efficiency
-                        timeout=800,  # A bit more time for combined optimization
-                        sampler=hpo_sampler,
-                        pruner=hpo_pruner,
-                        use_multi_fidelity=use_multi_fidelity,
-                    )
-                else:
-                    # Fallback to HPO for non-NAS approaches
-                    logger.info(f"NAS not supported for {approach}, falling back to HPO")
-                    val_error = temp_automl.fit_with_hpo(
-                        train_df, val_df, self.num_classes,
-                        n_trials=10,
-                        timeout=600,
-                        sampler=hpo_sampler,
-                        pruner=hpo_pruner,
-                        use_multi_fidelity=use_multi_fidelity,
-                    )
+                # Use existing combined NAS+HPO method (only for ffnn/lstm)
+                val_error = temp_automl.fit_with_nas_hpo(
+                    train_df, val_df, self.num_classes,
+                    n_trials=12,  # Reduced for NEPS efficiency
+                    timeout=800,  # A bit more time for combined optimization
+                    sampler=hpo_sampler,
+                    pruner=hpo_pruner,
+                    use_multi_fidelity=use_multi_fidelity,
+                )
             else:
                 raise ValueError(f"Unknown optimization strategy: {optimization_strategy}")
             
             training_time = time.time() - start_time
             
-            logger.info(f"NEPS approach trial completed: approach={approach}, strategy={optimization_strategy}, "
-                       f"multi_fidelity={use_multi_fidelity}, sampler={hpo_sampler}, pruner={hpo_pruner}, "
-                       f"val_error={val_error:.4f}, time={training_time:.2f}s")
+            logger.info(f"NEPS combination {combination_index} completed: approach={approach}, "
+                       f"strategy={optimization_strategy}, val_error={val_error:.4f}, time={training_time:.2f}s")
             
-            return {
-                'loss': val_error,
-                'cost': training_time,
-                'approach': approach,
-                'strategy': optimization_strategy,
-                'use_multi_fidelity': use_multi_fidelity,
-                'hpo_sampler': hpo_sampler,
-                'hpo_pruner': hpo_pruner,
-            }
+            # Return only the loss value for NEPS (NEPS expects a single value or dict with specific keys)
+            return val_error
             
         except Exception as e:
             training_time = time.time() - start_time if 'start_time' in locals() else 0.0
-            logger.error(f"NEPS approach trial failed: approach={approach}, strategy={optimization_strategy}, "
-                        f"multi_fidelity={use_multi_fidelity}, sampler={hpo_sampler}, pruner={hpo_pruner}, error={e}")
-            return {
-                'loss': float('inf'),
-                'cost': training_time,
-                'approach': approach,
-                'strategy': optimization_strategy,
-                'use_multi_fidelity': use_multi_fidelity,
-                'hpo_sampler': hpo_sampler,
-                'hpo_pruner': hpo_pruner,
-            }
+            logger.error(f"NEPS combination {combination_index} failed: error={e}")
+            # Return a high error value for failed trials
+            return float('inf')
 
     def fit_with_neps_auto_approach(
         self,
@@ -1774,27 +1789,7 @@ class TextAutoML:
         """
         if not NEPS_AVAILABLE:
             raise ImportError("NEPS is required for auto-approach selection. Install with: pip install neps")
-        # Enable NEPS debug logging
-        import logging as stdlib_logging
         
-        # Set NEPS logger to DEBUG level
-        neps_logger = stdlib_logging.getLogger('neps')
-        neps_logger.setLevel(stdlib_logging.DEBUG)
-        
-        # Create console handler if not exists
-        if not neps_logger.handlers:
-            console_handler = stdlib_logging.StreamHandler()
-            console_handler.setLevel(stdlib_logging.DEBUG)
-            formatter = stdlib_logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-            console_handler.setFormatter(formatter)
-            neps_logger.addHandler(console_handler)
-        
-        # Also enable root logger debug if needed
-        root_logger = stdlib_logging.getLogger()
-        if root_logger.level > stdlib_logging.DEBUG:
-            root_logger.setLevel(stdlib_logging.DEBUG)
-            
-        logger.info("NEPS debug logging enabled")             
         logger.info("Starting NEPS automatic approach selection...")
         logger.info("This will use existing Optuna methods (fit_with_hpo, fit_with_nas, fit_with_nas_hpo) internally")
         logger.info(f"Max evaluations: {max_evaluations}, Total timeout: {timeout}s")
@@ -1846,38 +1841,58 @@ class TextAutoML:
             best_config = best_result.best_config
             best_score = best_result.best_loss
             
+            # Extract actual parameters from combination_index
+            combination_index = best_config.get('combination_index', 0)
+            approach, optimization_strategy, hpo_sampler, hpo_pruner = self._valid_combinations[combination_index]
+            
             logger.info(f"NEPS auto-approach selection completed!")
-            logger.info(f"Best approach: {best_config.get('approach', 'unknown')}")
-            logger.info(f"Best optimization strategy: {best_config.get('optimization_strategy', 'unknown')}")
-            logger.info(f"Best multi-fidelity setting: {best_config.get('use_multi_fidelity', 'unknown')}")
-            logger.info(f"Best HPO sampler: {best_config.get('hpo_sampler', 'unknown')}")
-            logger.info(f"Best HPO pruner: {best_config.get('hpo_pruner', 'unknown')}")
+            logger.info(f"Best combination index: {combination_index}")
+            logger.info(f"Best approach: {approach}")
+            logger.info(f"Best optimization strategy: {optimization_strategy}")
+            logger.info(f"Best HPO sampler: {hpo_sampler}")
+            logger.info(f"Best HPO pruner: {hpo_pruner}")
             logger.info(f"Best validation error: {best_score:.4f}")
+            logger.info(f"Multi-fidelity: Always True (as requested)")
             
         except Exception as e:
             logger.warning(f"Could not retrieve NEPS results: {e}")
-            best_config = {
-                'approach': 'ffnn', 
-                'optimization_strategy': 'hpo',
-                'use_multi_fidelity': True,
-                'hpo_sampler': 'tpe',
-                'hpo_pruner': 'median'
-            }  # Safe fallback
-            best_score = float('inf')
+            # Try to get results from the best trial file
+            try:
+                import glob
+                result_files = glob.glob(str(root_dir / "results_*.yaml"))
+                if result_files:
+                    import yaml
+                    # Load the latest result file
+                    latest_file = max(result_files, key=os.path.getctime)
+                    with open(latest_file, 'r') as f:
+                        result_data = yaml.safe_load(f)
+                    
+                    best_config = result_data.get('config', {})
+                    combination_index = best_config.get('combination_index', 0)
+                    approach, optimization_strategy, hpo_sampler, hpo_pruner = self._valid_combinations[combination_index]
+                    best_score = result_data.get('result', {}).get('loss', float('inf'))
+                    logger.info(f"Retrieved results from file: {latest_file}")
+                else:
+                    raise Exception("No result files found")
+                    
+            except Exception as e2:
+                logger.warning(f"Could not retrieve NEPS results from files: {e2}")
+                # Use first combination as fallback (ffnn + hpo)
+                approach, optimization_strategy, hpo_sampler, hpo_pruner = self._valid_combinations[4]  # ffnn+hpo+tpe+median
+                best_score = float('inf')
         
         # Train final model with best approach and strategy
-        if best_config and best_score < float('inf'):
+        if best_score < float('inf'):
             logger.info("Training final model with best approach and optimization strategy...")
             
-            best_approach = best_config.get('approach', 'ffnn')
-            best_strategy = best_config.get('optimization_strategy', 'hpo')
-            best_multi_fidelity = best_config.get('use_multi_fidelity', True)
-            best_sampler = best_config.get('hpo_sampler', 'tpe')
-            best_pruner = best_config.get('hpo_pruner', 'median')
+            best_approach = approach
+            best_strategy = optimization_strategy
+            best_sampler = hpo_sampler
+            best_pruner = hpo_pruner
             
             # Update current instance with best approach and settings
             self.approach = best_approach
-            self.use_multi_fidelity = best_multi_fidelity
+            self.use_multi_fidelity = True
             self.hpo_sampler = best_sampler
             self.hpo_pruner = best_pruner
             
@@ -1892,7 +1907,7 @@ class TextAutoML:
                     timeout=1800,  # 30 minutes for final optimization
                     sampler=best_sampler,
                     pruner=best_pruner,
-                    use_multi_fidelity=best_multi_fidelity,
+                    use_multi_fidelity=True,
                     save_path=save_path,
                     **kwargs
                 )
@@ -1914,7 +1929,7 @@ class TextAutoML:
                         timeout=1800,
                         sampler=best_sampler,
                         pruner=best_pruner,
-                        use_multi_fidelity=best_multi_fidelity,
+                        use_multi_fidelity=True,
                         save_path=save_path,
                         **kwargs
                     )
@@ -1927,7 +1942,7 @@ class TextAutoML:
                         timeout=2400,  # 40 minutes for combined optimization
                         sampler=best_sampler,
                         pruner=best_pruner,
-                        use_multi_fidelity=best_multi_fidelity,
+                        use_multi_fidelity=True,
                         save_path=save_path,
                         **kwargs
                     )
@@ -1939,7 +1954,7 @@ class TextAutoML:
                         timeout=1800,
                         sampler=best_sampler,
                         pruner=best_pruner,
-                        use_multi_fidelity=best_multi_fidelity,
+                        use_multi_fidelity=True,  # Always True as requested
                         save_path=save_path,
                         **kwargs
                     )
@@ -1949,7 +1964,7 @@ class TextAutoML:
             logger.info(f"NEPS auto-approach pipeline completed!")
             logger.info(f"Final approach: {best_approach}")
             logger.info(f"Final strategy: {best_strategy}")
-            logger.info(f"Final multi-fidelity: {best_multi_fidelity}")
+            logger.info(f"Final multi-fidelity: True")
             logger.info(f"Final sampler: {best_sampler}")
             logger.info(f"Final pruner: {best_pruner}")
             logger.info(f"Final validation error: {final_score:.4f}")
@@ -1960,7 +1975,7 @@ class TextAutoML:
                     'neps_auto_approach': True,
                     'best_approach': best_approach,
                     'best_optimization_strategy': best_strategy,
-                    'best_use_multi_fidelity': best_multi_fidelity,
+                    'best_use_multi_fidelity': True,  # Always True as requested
                     'best_hpo_sampler': best_sampler,
                     'best_hpo_pruner': best_pruner,
                     'neps_best_validation_error': float(best_score),
