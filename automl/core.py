@@ -1567,13 +1567,12 @@ class TextAutoML:
             raise ImportError("NEPS is required. Install with: pip install neps")
             
         search_space = {
-            'approach': neps.CategoricalParameter(choices=['logistic', 'ffnn', 'lstm', 'transformer']),
-            'optimization_strategy': neps.CategoricalParameter(choices=['basic', 'hpo', 'nas', 'nas_hpo']),
-            'use_multi_fidelity': neps.CategoricalParameter(choices=[True, False]),
-            'hpo_sampler': neps.CategoricalParameter(choices=['tpe', 'random', 'cmaes', 'nsga2']),
-            'hpo_pruner': neps.CategoricalParameter(choices=['median', 'successive_halving', 'hyperband']),
+            'approach': neps.Categorical(['logistic', 'ffnn', 'lstm', 'transformer']),
+            'optimization_strategy': neps.Categorical(['basic', 'hpo', 'nas', 'nas_hpo']),
+            'use_multi_fidelity': neps.Categorical([True, False]),
+            'hpo_sampler': neps.Categorical(['tpe', 'random', 'cmaes', 'nsga2']),
+            'hpo_pruner': neps.Categorical(['median', 'successive_halving', 'hyperband']),
         }
-        
         logger.info("Created NEPS approach selection search space with multi-fidelity options")
         return search_space
 
@@ -1715,8 +1714,8 @@ class TextAutoML:
         num_classes: int,
         max_evaluations: int = 16,  # 4 approaches × 4 strategies = 16 combinations
         timeout: int = 7200,  # 2 hours total
-        searcher: str = 'bayesian_optimization',
-        working_directory: str = "./neps_auto_approach",
+        optimizer: str = 'bayesian_optimization',
+        root_directory: str = "./neps_auto_approach",
         save_path: Path = None,
         **kwargs
     ):
@@ -1731,8 +1730,8 @@ class TextAutoML:
         - num_classes: Number of output classes
         - max_evaluations: Maximum number of approach+strategy combinations to try
         - timeout: Total timeout in seconds
-        - searcher: NEPS searcher algorithm
-        - working_directory: NEPS working directory
+        - optimizer: NEPS optimizer algorithm
+        - root_directory: NEPS root directory
         - save_path: Path to save final model
         """
         if not NEPS_AVAILABLE:
@@ -1759,16 +1758,16 @@ class TextAutoML:
         # Create search space for approach selection
         search_space = self._create_neps_approach_search_space()
         
-        # Setup working directory
-        working_dir = Path(working_directory)
-        working_dir.mkdir(parents=True, exist_ok=True)
+        # Setup root directory
+        root_dir = Path(root_directory)
+        root_dir.mkdir(parents=True, exist_ok=True)
         
         # Configure NEPS run
         neps_config = {
             'pipeline_space': search_space,
-            'working_directory': str(working_dir),
+            'root_directory': str(root_dir),
             'max_evaluations_total': max_evaluations,
-            'searcher': searcher,
+            'optimizer': optimizer,
         }
         
         if timeout > 0:
@@ -1778,13 +1777,13 @@ class TextAutoML:
         
         # Run NEPS optimization
         neps.run(
-            run_pipeline=self._neps_approach_objective,
+            evaluate_pipeline=self._neps_approach_objective,
             **neps_config
         )
         
         # Get best result
         try:
-            best_result = neps.status(working_dir)
+            best_result = neps.status(root_dir)
             best_config = best_result.best_config
             best_score = best_result.best_loss
             
@@ -1909,7 +1908,7 @@ class TextAutoML:
                     'final_validation_error': float(final_score),
                     'max_evaluations': max_evaluations,
                     'total_timeout': timeout,
-                    'searcher': searcher,
+                    'optimizer': optimizer,
                     'seed': self.seed,
                 }
                 
