@@ -1736,7 +1736,27 @@ class TextAutoML:
         """
         if not NEPS_AVAILABLE:
             raise ImportError("NEPS is required for auto-approach selection. Install with: pip install neps")
+        # Enable NEPS debug logging
+        import logging as stdlib_logging
+        
+        # Set NEPS logger to DEBUG level
+        neps_logger = stdlib_logging.getLogger('neps')
+        neps_logger.setLevel(stdlib_logging.DEBUG)
+        
+        # Create console handler if not exists
+        if not neps_logger.handlers:
+            console_handler = stdlib_logging.StreamHandler()
+            console_handler.setLevel(stdlib_logging.DEBUG)
+            formatter = stdlib_logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            console_handler.setFormatter(formatter)
+            neps_logger.addHandler(console_handler)
+        
+        # Also enable root logger debug if needed
+        root_logger = stdlib_logging.getLogger()
+        if root_logger.level > stdlib_logging.DEBUG:
+            root_logger.setLevel(stdlib_logging.DEBUG)
             
+        logger.info("NEPS debug logging enabled")             
         logger.info("Starting NEPS automatic approach selection...")
         logger.info("This will use existing Optuna methods (fit_with_hpo, fit_with_nas, fit_with_nas_hpo) internally")
         logger.info(f"Max evaluations: {max_evaluations}, Total timeout: {timeout}s")
