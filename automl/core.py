@@ -1438,6 +1438,7 @@ class TextAutoML:
         })
         
         try:
+            temp_automl.num_classes = self.num_classes
             # Set current trial for multi-fidelity HPO
             temp_automl.current_trial = trial
             
